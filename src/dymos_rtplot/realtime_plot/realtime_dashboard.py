@@ -373,40 +373,58 @@ class _TrajectoryTab:
     def _state_trace(self, case, phase_meta, variable, rates_only=False):
         if variable not in phase_meta["states"]:
             return None, None, np.array([], dtype=bool), None
-        if phase_meta.get("grid_type") != "lgl" or "state_interp" not in phase_meta:
+        if "state_interp" not in phase_meta:
+            if rates_only:
+                rate_meta = phase_meta.get("timeseries_outputs", {}).get(f"state_rates:{variable}")
+                if rate_meta:
+                    return self._timeseries_trace(case, phase_meta, rate_meta["path"])
+                return None, None, np.array([], dtype=bool), None
             return self._timeseries_trace(case, phase_meta, f"timeseries.states:{variable}", boundary_state=phase_meta["states"][variable])
 
         state_meta = phase_meta["states"][variable]
         phase_path = phase_meta["promoted_path"]
         state_input = np.asarray(case.get_val(f"{phase_path}.states:{variable}"))
         state_disc = state_input[np.asarray(phase_meta["state_input_to_disc"], dtype=int)]
-        rate_meta = state_meta["rate_source"]
-        try:
-            rate_values = np.asarray(case.get_val(rate_meta["path"]))
-        except Exception:
-            return self._timeseries_trace(case, phase_meta, f"timeseries.states:{variable}", boundary_state=state_meta,
-                                          warning=f"Missing exact state rate source {rate_meta['path']}; using recorded nodes.")
-
-        row_idx = np.asarray(rate_meta["rows"], dtype=int)
-        rate_disc = rate_values[row_idx]
         shape = tuple(state_meta["shape"])
         size = int(np.prod(shape))
         xd_flat = np.reshape(state_disc, (state_disc.shape[0], size))
-        fd_flat = np.reshape(rate_disc, (rate_disc.shape[0], size))
 
         interp = phase_meta["state_interp"]
-        ai = np.asarray(interp["Ai"], dtype=float)
-        bi = np.asarray(interp["Bi"], dtype=float)
-        ad = np.asarray(interp["Ad"], dtype=float)
-        bd = np.asarray(interp["Bd"], dtype=float)
         dt_dstau = 0.5 * _scalar_item(case.get_val(f"{phase_path}.t_duration")) * np.asarray(
             phase_meta["dense_grid"]["node_dptau_dstau"], dtype=float
         )
         dense_x = self._physical_time(case, phase_meta)
-        if rates_only:
-            dense_val = ad.dot(xd_flat) / dt_dstau[:, np.newaxis] + bd.dot(fd_flat)
+        if interp.get("mode") == "lagrange":
+            lmat = np.asarray(interp["L"], dtype=float)
+            dmat = np.asarray(interp["D"], dtype=float)
+            if rates_only:
+                dense_val = dmat.dot(xd_flat) / dt_dstau[:, np.newaxis]
+            else:
+                dense_val = lmat.dot(xd_flat)
         else:
-            dense_val = ai.dot(xd_flat) + bi.dot(fd_flat) * dt_dstau[:, np.newaxis]
+            rate_meta = state_meta["rate_source"]
+            try:
+                rate_values = np.asarray(case.get_val(rate_meta["path"]))
+            except Exception:
+                return self._timeseries_trace(
+                    case,
+                    phase_meta,
+                    f"timeseries.states:{variable}",
+                    boundary_state=state_meta,
+                    warning=f"Missing exact state rate source {rate_meta['path']}; using recorded nodes.",
+                )
+
+            row_idx = np.asarray(rate_meta["rows"], dtype=int)
+            rate_disc = rate_values[row_idx]
+            fd_flat = np.reshape(rate_disc, (rate_disc.shape[0], size))
+            ai = np.asarray(interp["Ai"], dtype=float)
+            bi = np.asarray(interp["Bi"], dtype=float)
+            ad = np.asarray(interp["Ad"], dtype=float)
+            bd = np.asarray(interp["Bd"], dtype=float)
+            if rates_only:
+                dense_val = ad.dot(xd_flat) / dt_dstau[:, np.newaxis] + bd.dot(fd_flat)
+            else:
+                dense_val = ai.dot(xd_flat) + bi.dot(fd_flat) * dt_dstau[:, np.newaxis]
         dense_val = np.reshape(dense_val, (dense_val.shape[0],) + shape)
         yvals = dense_val[:, 0] if dense_val.ndim > 1 else dense_val
         violation = self._bounds_violation(yvals[:, np.newaxis], state_meta)
@@ -415,7 +433,7 @@ class _TrajectoryTab:
     def _control_trace(self, case, phase_meta, variable, derivative_order=0):
         if variable not in phase_meta["controls"]:
             return None, None, np.array([], dtype=bool), None
-        if phase_meta.get("grid_type") != "lgl" or "control_interp" not in phase_meta:
+        if "control_interp" not in phase_meta:
             suffix = variable
             if derivative_order == 1:
                 suffix = f"control_rates:{variable}_rate"
