@@ -23,3 +23,9 @@ Or use the console script after the editable install:
 ```powershell
 dymos-rtplot scratch\multiphase_dymos_rtplot_mission.py
 ```
+
+You can also run the installed package directly:
+
+```powershell
+python -m dymos_rtplot scratch\multiphase_dymos_rtplot_mission.py
+```

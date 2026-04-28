@@ -26,6 +26,7 @@ dev = [
 
 [project.scripts]
 dymos-rtplot = "dymos_rtplot.rtplot:main"
+dymos_rtplot = "dymos_rtplot.rtplot:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
