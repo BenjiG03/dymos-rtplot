@@ -552,19 +552,22 @@ class _TrajectoryTab:
 
 
 class _SeriesTab:
+    _GROUP_LABEL_TO_KEY = {
+        "Scaled Objectives": "scaled_objs",
+        "Scaled Design Vars": "scaled_desvars",
+        "Scaled Constraints": "scaled_cons",
+        "Optimizer History": "opt_history",
+    }
+
     def __init__(self, broker):
         self._broker = broker
+        self._updating_widgets = False
         self._source = ColumnDataSource(data=dict(iteration=[]))
         self._warning = Div(text="")
         self._group_select = Select(
             title="Group",
-            options=[
-                ("scaled_objs", "Scaled Objectives"),
-                ("scaled_desvars", "Scaled Design Vars"),
-                ("scaled_cons", "Scaled Constraints"),
-                ("opt_history", "Optimizer History"),
-            ],
-            value="scaled_objs",
+            options=list(self._GROUP_LABEL_TO_KEY.keys()),
+            value="Scaled Objectives",
         )
         self._var_select = MultiChoice(title="Variables", options=[], value=[])
         self._figure = figure(
@@ -583,32 +586,51 @@ class _SeriesTab:
         self.panel = TabPanel(child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"), title="Scaled + Opt")
 
     def _selection_changed(self, attr, old, new):
+        if self._updating_widgets:
+            return
+        if attr == "value" and self._group_select.value != old and self._group_select.value == new:
+            self._updating_widgets = True
+            try:
+                self._var_select.value = []
+            finally:
+                self._updating_widgets = False
         self.refresh(force=True)
 
     def _options_for_group(self):
         snapshot = self._broker.latest_snapshot()
         if snapshot is None:
             return []
-        if self._group_select.value == "scaled_objs":
+        group_key = self._GROUP_LABEL_TO_KEY.get(self._group_select.value, "scaled_objs")
+        if group_key == "scaled_objs":
             return sorted(snapshot.scaled_objs.keys())
-        if self._group_select.value == "scaled_desvars":
+        if group_key == "scaled_desvars":
             return sorted(snapshot.scaled_desvars.keys())
-        if self._group_select.value == "scaled_cons":
+        if group_key == "scaled_cons":
             return sorted(snapshot.scaled_cons.keys())
         return sorted(self._broker.get_history_keys())
 
     def refresh(self, force=False):
         options = self._options_for_group()
-        self._var_select.options = options
-        if not self._var_select.value and options:
-            self._var_select.value = options[: min(4, len(options))]
         selected = [name for name in self._var_select.value if name in options]
+        if not selected and options:
+            selected = options[: min(4, len(options))]
+        self._updating_widgets = True
+        try:
+            self._var_select.options = options
+            if self._var_select.value != selected:
+                self._var_select.value = selected
+        finally:
+            self._updating_widgets = False
         if not selected:
+            for renderer in self._renderers.values():
+                renderer.visible = False
+            self._source.data = dict(iteration=[])
             return
         iterations = [snapshot.major_iteration for snapshot in self._broker.snapshots]
         data = {"iteration": iterations}
+        group_key = self._GROUP_LABEL_TO_KEY.get(self._group_select.value, "scaled_objs")
         for name in selected:
-            series = self._broker.get_series(self._group_select.value, name)
+            series = self._broker.get_series(group_key, name)
             data[name] = [_scalar_for_plot(item) for item in series]
         self._source.data = data
         existing = set(self._renderers)
@@ -629,7 +651,7 @@ class _SeriesTab:
             self._renderers[name].visible = False
         self._figure.legend.click_policy = "hide"
         warning = self._broker.get_history_warning()
-        if self._group_select.value == "opt_history" and not self._broker.get_history_keys():
+        if group_key == "opt_history" and not self._broker.get_history_keys():
             warning = "No pyOptSparse .hst file available, so optimizer diagnostics are unavailable."
         self._warning.text = warning or ""
 

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dymos-rtplot"
+version = "0.1.0"
+description = "Dymos-focused realtime optimization plotting built from OpenMDAO rtplot."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "OpenAI Codex" },
+]
+dependencies = [
+  "bokeh>=3",
+  "dymos",
+  "numpy",
+  "openmdao",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyoptsparse",
+]
+
+[project.scripts]
+dymos-rtplot = "dymos_rtplot.rtplot:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dymos_rtplot = [
+  "realtime_plot/images/*.png",
+]
