@@ -2,10 +2,11 @@ import unittest
 from unittest import mock
 import queue as std_queue
 
+import numpy as np
 from bokeh.models import Div
 
 from dymos_rtplot import rtplot
-from dymos_rtplot.realtime_plot import realtime_dashboard, realtime_plot
+from dymos_rtplot.realtime_plot import realtime_broker, realtime_dashboard, realtime_plot
 
 
 class _FakeCaseTracker:
@@ -20,15 +21,22 @@ class _FakeBroker:
     def __init__(self, metadata=None):
         self.metadata = metadata or {}
         self.snapshots = []
+        self.history_entries = []
+        self.history_warning = None
 
     def latest_snapshot(self):
         return self.snapshots[-1] if self.snapshots else None
 
     def get_history_keys(self):
-        return []
+        if not self.history_entries:
+            return []
+        return list(self.history_entries[0].keys())
 
     def get_history_warning(self):
-        return None
+        return self.history_warning
+
+    def get_history_entries(self):
+        return list(self.history_entries)
 
     def get_series(self, group, name):
         return []
@@ -126,6 +134,50 @@ class _FakeKernel32:
     def _set_process_affinity_mask(self, handle, mask_value):
         self.affinity_calls.append((handle, mask_value))
         return 1
+
+
+class _FakeCase:
+    def __init__(self, counter=1, timestamp=1.0, fail_builds=0):
+        self.counter = counter
+        self.timestamp = timestamp
+        self._fail_builds = fail_builds
+
+    def _maybe_fail(self):
+        if self._fail_builds > 0:
+            self._fail_builds -= 1
+            raise RuntimeError("transient read failure")
+
+    def get_objectives(self, scaled=False):
+        self._maybe_fail()
+        return {"obj": [1.0] if not scaled else [10.0]}
+
+    def get_design_vars(self, scaled=False):
+        self._maybe_fail()
+        return {"dv": [2.0] if not scaled else [20.0]}
+
+    def get_constraints(self, scaled=False):
+        self._maybe_fail()
+        return {"con": [3.0] if not scaled else [30.0]}
+
+
+class _FakeBrokerCaseTracker:
+    def __init__(self, cases=None, running=False):
+        self.cases = dict(cases or {})
+        self.running = running
+
+    def get_case_by_counter(self, counter):
+        return self.cases.get(counter)
+
+    def is_source_process_running(self):
+        return self.running
+
+
+class _FakeCaseValues:
+    def __init__(self, values):
+        self._values = values
+
+    def get_val(self, path):
+        return self._values[path]
 
 
 class _FakeSession:
@@ -442,6 +494,23 @@ class MultiWindowParsingTests(unittest.TestCase):
         self.assertEqual(tab._figure.legend[0].location, "top_left")
         self.assertEqual(tab._figure.legend[0].click_policy, "hide")
 
+    def test_series_tab_uses_history_iteration_axis_when_counts_diverge(self):
+        broker = _FakeBroker()
+        broker.snapshots = [_FakeSnapshot(), _FakeSnapshot(), _FakeSnapshot()]
+        broker.history_entries = [
+            {"iter": [10], "metric": [1.5]},
+            {"iter": [20], "metric": [2.5]},
+        ]
+        tab = realtime_dashboard._SeriesTab(broker)
+        tab._group_select.value = "Optimizer History"
+        tab._var_select.value = ["metric"]
+
+        tab.refresh(force=True)
+
+        self.assertEqual(list(tab._source.data["iteration"]), [10.0, 20.0])
+        self.assertEqual(list(tab._source.data["metric"]), [1.5, 2.5])
+        self.assertIn("diverged", tab._warning.text)
+
     def test_jacobian_entries_tab_refresh_keeps_visible_legend(self):
         broker = _FakeBroker()
         snapshot = _FakeSnapshot()
@@ -455,6 +524,122 @@ class MultiWindowParsingTests(unittest.TestCase):
         self.assertTrue(tab._figure.legend[0].visible)
         self.assertEqual(tab._figure.legend[0].location, "top_left")
         self.assertEqual(tab._figure.legend[0].click_policy, "hide")
+
+    def test_jacobian_entries_tab_filters_missing_derivative_iterations(self):
+        broker = _FakeBroker()
+        s1 = _FakeSnapshot()
+        s1.major_iteration = 1
+        s1.derivatives = None
+        s2 = _FakeSnapshot()
+        s2.major_iteration = 2
+        s2.derivatives = {("of", "wrt"): np.array([[3.0]])}
+        s3 = _FakeSnapshot()
+        s3.major_iteration = 3
+        s3.derivatives = {("of", "wrt"): np.array([[4.0]])}
+        broker.snapshots = [s1, s2, s3]
+        tab = realtime_dashboard._JacobianEntriesTab(broker)
+        tab._selected_block = "of | wrt"
+        tab._block_select.value = "of | wrt"
+        tab._entry_select.value = ["0,0"]
+
+        tab.refresh(force=True)
+
+        self.assertEqual(list(tab._source.data["iteration"]), [2, 3])
+        self.assertEqual(list(tab._source.data["0,0"]), [3.0, 4.0])
+        self.assertIn("no derivative block", tab._warning.text)
+
+    def test_state_marker_trace_uses_discrete_state_nodes(self):
+        broker = _FakeBroker(metadata={"trajectories": []})
+        tab = realtime_dashboard._TrajectoryTab(broker)
+        case = _FakeCaseValues(
+            {
+                "traj.phase0.states:x": [[10.0], [20.0], [30.0]],
+                "traj.phase0.t_duration": [100.0],
+            }
+        )
+        phase_meta = {
+            "promoted_path": "traj.phase0",
+            "state_input_node_ptau": [-1.0, 0.0, 1.0],
+        }
+
+        xvals, yvals = tab._state_marker_trace(case, phase_meta, "x")
+
+        self.assertEqual(list(xvals), [0.0, 50.0, 100.0])
+        self.assertEqual(list(yvals), [10.0, 20.0, 30.0])
+
+    def test_control_marker_trace_uses_discrete_control_nodes(self):
+        broker = _FakeBroker(metadata={"trajectories": []})
+        tab = realtime_dashboard._TrajectoryTab(broker)
+        case = _FakeCaseValues(
+            {
+                "traj.phase0.controls:u": [[1.0], [2.0], [3.0], [4.0]],
+                "traj.phase0.t_duration": [20.0],
+            }
+        )
+        phase_meta = {
+            "promoted_path": "traj.phase0",
+            "control_input_node_ptau": [-1.0, -0.5, 0.5, 1.0],
+        }
+
+        xvals, yvals = tab._control_marker_trace(case, phase_meta, "u")
+
+        self.assertEqual(list(xvals), [0.0, 5.0, 15.0, 20.0])
+        self.assertEqual(list(yvals), [1.0, 2.0, 3.0, 4.0])
+
+    def test_collapse_repeated_samples_drops_duplicate_boundary_points(self):
+        xvals, yvals, violation = realtime_dashboard._collapse_repeated_samples(
+            [0.0, 1.0, 1.0, 2.0],
+            [10.0, 20.0, 20.0, 30.0],
+            [False, False, True, False],
+        )
+
+        self.assertEqual(list(xvals), [0.0, 1.0, 2.0])
+        self.assertEqual(list(yvals), [10.0, 20.0, 30.0])
+        self.assertEqual(list(violation), [False, True, False])
+
+    def test_collapse_repeated_samples_keeps_discontinuous_duplicates(self):
+        xvals, yvals, violation = realtime_dashboard._collapse_repeated_samples(
+            [0.0, 1.0, 1.0, 2.0],
+            [10.0, 20.0, 21.0, 30.0],
+            [False, False, True, False],
+        )
+
+        self.assertEqual(list(xvals), [0.0, 1.0, 1.0, 2.0])
+        self.assertEqual(list(yvals), [10.0, 20.0, 21.0, 30.0])
+        self.assertEqual(list(violation), [False, False, True, False])
+
+    def test_matrix_rank_and_condition_reports_infinite_for_singular_matrix(self):
+        rank, cond = realtime_dashboard._matrix_rank_and_condition([[1.0, 2.0], [2.0, 4.0]])
+        self.assertEqual(rank, 1)
+        self.assertEqual(cond, float("inf"))
+
+    def test_dependent_indices_identify_redundant_columns_and_rows(self):
+        matrix = np.array([[1.0, 2.0, 0.0], [2.0, 4.0, 0.0], [0.0, 0.0, 0.0]])
+        dep_cols = realtime_dashboard._dependent_indices(matrix, "columns")
+        dep_rows = realtime_dashboard._dependent_indices(matrix, "rows")
+        self.assertEqual(len(dep_cols), 2)
+        self.assertEqual(len(dep_rows), 2)
+        self.assertTrue(set(dep_cols).issubset({0, 1, 2}))
+        self.assertTrue(set(dep_rows).issubset({0, 1, 2}))
+
+    def test_jacobian_heatmap_warns_on_singular_and_dependent_structure(self):
+        broker = _FakeBroker()
+        snapshot = _FakeSnapshot()
+        snapshot.derivatives = {
+            ("of", "x"): np.array([[1.0, 2.0], [2.0, 4.0], [0.0, 0.0]]),
+        }
+        broker.snapshots = [snapshot]
+        tab = realtime_dashboard._JacobianHeatmapTab(broker)
+
+        tab.refresh(force=True)
+
+        self.assertIn("condition number is infinite", tab._warning.text)
+        self.assertIn("Zero rows:", tab._warning.text)
+        self.assertIn("Dependent rows:", tab._warning.text)
+        self.assertIn("Dependent columns:", tab._warning.text)
+        self.assertIn("cond=inf", tab._stats.text)
+        self.assertTrue(tab._row_highlight_source.data["kind"])
+        self.assertTrue(tab._col_highlight_source.data["kind"])
 
     def test_launch_multiwindow_dashboard_starts_selected_tabs_and_opens_browser(self):
         messages = [
@@ -516,6 +701,37 @@ class MultiWindowParsingTests(unittest.TestCase):
                     core_assignments={},
                     base_port=58000,
                 )
+
+    def test_live_data_broker_retries_transient_unreadable_case(self):
+        tracker = _FakeBrokerCaseTracker(cases={1: _FakeCase(fail_builds=1)})
+        broker = realtime_broker.LiveDataBroker(tracker)
+
+        first = broker.poll()
+        second = broker.poll()
+
+        self.assertEqual(first, [])
+        self.assertEqual(len(second), 1)
+        self.assertEqual(len(broker.snapshots), 1)
+        self.assertEqual(broker.latest_snapshot().counter, 1)
+
+    def test_dashboard_update_retries_after_broker_error(self):
+        dashboard = object.__new__(realtime_dashboard._RealTimeDymosDashboard)
+        dashboard._tab_objects = {
+            realtime_dashboard.CASE_PLOTTER_TAB: mock.Mock(),
+            realtime_dashboard.TRAJECTORY_TAB: mock.Mock(),
+            realtime_dashboard.SERIES_TAB: mock.Mock(),
+        }
+        dashboard._tab_objects[realtime_dashboard.CASE_PLOTTER_TAB]._update_wrapped_in_try = mock.Mock()
+        dashboard._broker = mock.Mock()
+        dashboard._broker.poll.side_effect = RuntimeError("transient refresh failure")
+        dashboard._tabs = mock.Mock(active=0)
+        dashboard._last_active = 0
+        dashboard._tab_rendered = {}
+
+        realtime_dashboard._RealTimeDymosDashboard._update(dashboard)
+
+        dashboard._tab_objects[realtime_dashboard.CASE_PLOTTER_TAB]._update_wrapped_in_try.assert_called_once()
+        dashboard._broker.poll.assert_called_once()
 
 
 if __name__ == "__main__":

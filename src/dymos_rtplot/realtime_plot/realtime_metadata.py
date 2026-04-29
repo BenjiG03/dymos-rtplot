@@ -297,6 +297,12 @@ def build_rtplot_metadata(problem, case_recorder_filename):
                     'node_dptau_dstau': output_grid.node_dptau_dstau.tolist(),
                     'segment_indices': output_grid.segment_indices.tolist(),
                 },
+                'state_input_node_ptau': grid_data.node_ptau[
+                    grid_data.subset_node_indices['state_disc'][grid_data.input_maps['state_input_to_disc']]
+                ].tolist(),
+                'control_input_node_ptau': grid_data.node_ptau[
+                    grid_data.subset_node_indices['control_disc'][grid_data.input_maps['dynamic_control_input_to_disc']]
+                ].tolist(),
                 'states': {},
                 'controls': {},
                 'timeseries_outputs': _timeseries_output_meta(phase),

@@ -75,7 +75,14 @@ class LiveDataBroker:
             case = self.case_tracker.get_case_by_counter(self._next_counter)
             if case is None:
                 break
-            snapshot = self._build_snapshot(case)
+            try:
+                snapshot = self._build_snapshot(case)
+            except Exception as exc:
+                print(
+                    "LiveDataBroker will retry unreadable driver case "
+                    f"{self._next_counter} on the next refresh: {exc}"
+                )
+                break
             self.snapshots.append(snapshot)
             new_snapshots.append(snapshot)
             self._next_counter += 1
@@ -171,6 +178,9 @@ class LiveDataBroker:
 
     def get_history_warning(self):
         return self._history_aligned_warning
+
+    def get_history_entries(self):
+        return list(self._history_cache)
 
     def get_series(self, group, name):
         out = []

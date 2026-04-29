@@ -8,12 +8,14 @@ import numbers
 import numpy as np
 from openmdao.core.constants import INF_BOUND
 from openmdao.utils.shell_proc import _is_process_running
+from scipy.linalg import qr
 
 from dymos_rtplot.realtime_plot.realtime_broker import LiveDataBroker
 from dymos_rtplot.realtime_plot.realtime_optimizer_plot import _RealTimeOptimizerPlot
 
 from bokeh.layouts import column, gridplot, row
 from bokeh.models import (
+    BoxAnnotation,
     CheckboxGroup,
     ColumnDataSource,
     Div,
@@ -115,6 +117,79 @@ def _constraint_violation(values, lower=None, upper=None, equals=None):
     if upper is not None and _is_finite_bound(upper, sign=1):
         violation |= np.any(vals > float(upper) + 1.0e-8, axis=reduce_axes)
     return violation
+
+
+def _collapse_repeated_samples(xvals, yvals, violation=None, atol=1.0e-10, rtol=1.0e-10):
+    x = np.asarray(xvals, dtype=float)
+    y = np.asarray(yvals, dtype=float)
+    if x.size <= 1:
+        if violation is None:
+            return x, y, violation
+        return x, y, np.asarray(violation, dtype=bool)
+
+    keep = np.ones(x.shape[0], dtype=bool)
+    if violation is None:
+        violation_arr = None
+    else:
+        violation_arr = np.asarray(violation, dtype=bool)
+
+    for idx in range(1, x.shape[0]):
+        if x[idx] != x[idx - 1]:
+            continue
+        if np.allclose(y[idx], y[idx - 1], atol=atol, rtol=rtol):
+            keep[idx] = False
+            if violation_arr is not None:
+                violation_arr[idx - 1] = violation_arr[idx - 1] or violation_arr[idx]
+
+    if violation_arr is None:
+        return x[keep], y[keep], None
+    return x[keep], y[keep], violation_arr[keep]
+
+
+def _matrix_rank_and_condition(matrix):
+    arr = np.asarray(matrix, dtype=float)
+    if arr.size == 0:
+        return 0, float("nan")
+    try:
+        singular_values = np.linalg.svd(arr, compute_uv=False)
+    except np.linalg.LinAlgError:
+        return int(np.linalg.matrix_rank(arr)), float("nan")
+    if singular_values.size == 0:
+        return 0, float("nan")
+    rank_tol = np.max(arr.shape) * np.finfo(float).eps * singular_values[0]
+    rank = int(np.sum(singular_values > rank_tol))
+    smallest = singular_values[-1]
+    if smallest <= rank_tol:
+        return rank, float("inf")
+    return rank, float(singular_values[0] / smallest)
+
+
+def _dependent_indices(matrix, axis, tol=_ZERO_JAC_THRESHOLD):
+    arr = np.asarray(matrix, dtype=float)
+    if arr.size == 0:
+        return []
+    work = arr if axis == "columns" else arr.T
+    if work.size == 0:
+        return []
+    try:
+        _, rmat, pivots = qr(work, mode="economic", pivoting=True)
+    except Exception:
+        return []
+    diag = np.abs(np.diag(rmat))
+    if diag.size == 0:
+        return list(sorted(int(idx) for idx in pivots))
+    dep_tol = max(tol, diag[0] * max(work.shape) * np.finfo(float).eps)
+    rank = int(np.sum(diag > dep_tol))
+    return list(sorted(int(idx) for idx in pivots[rank:]))
+
+
+def _format_suspicious_labels(labels, limit=6):
+    if not labels:
+        return "none"
+    shown = list(labels[:limit])
+    if len(labels) > limit:
+        shown.append(f"... +{len(labels) - limit} more")
+    return ", ".join(shown)
 
 
 class _TrajectoryTab:
@@ -461,6 +536,7 @@ class _TrajectoryTab:
         dense_val = np.reshape(dense_val, (dense_val.shape[0],) + shape)
         yvals = dense_val[:, 0] if dense_val.ndim > 1 else dense_val
         violation = self._bounds_violation(yvals[:, np.newaxis], state_meta)
+        dense_x, yvals, violation = _collapse_repeated_samples(dense_x, yvals, violation)
         return dense_x, np.asarray(yvals, dtype=float), violation, None
 
     def _control_trace(self, case, phase_meta, variable, derivative_order=0):
@@ -498,6 +574,7 @@ class _TrajectoryTab:
         dense_val = np.reshape(dense_val, (dense_val.shape[0],) + shape)
         yvals = dense_val[:, 0] if dense_val.ndim > 1 else dense_val
         violation = self._bounds_violation(yvals[:, np.newaxis], phase_meta["controls"][variable])
+        dense_x, yvals, violation = _collapse_repeated_samples(dense_x, yvals, violation)
         return dense_x, np.asarray(yvals, dtype=float), violation, None
 
     def _ode_trace(self, case, phase_meta, variable):
@@ -521,13 +598,14 @@ class _TrajectoryTab:
         constraint_violation = self._constraint_violation_for_path(case, phase_meta, path)
         if constraint_violation is not None and len(constraint_violation) == len(violation):
             violation |= constraint_violation
+        xvals, yvals, violation = _collapse_repeated_samples(xvals, yvals, violation)
         return xvals, np.asarray(yvals, dtype=float), violation, warning
 
     def _phase_marker_trace(self, case, phase_meta, category, variable):
         if category == "states":
-            return self._marker_trace(case, phase_meta, f"timeseries.states:{variable}")
+            return self._state_marker_trace(case, phase_meta, variable)
         if category == "controls":
-            return self._marker_trace(case, phase_meta, f"timeseries.controls:{variable}")
+            return self._control_marker_trace(case, phase_meta, variable)
         if category == "state_rates":
             meta = phase_meta.get("timeseries_outputs", {}).get(f"state_rates:{variable}")
             if meta:
@@ -547,6 +625,44 @@ class _TrajectoryTab:
             return self._marker_trace(case, phase_meta, meta["path"])
         return None, None
 
+    def _phase_time_from_ptau(self, case, phase_meta, node_ptau):
+        t_initial = self._phase_initial_time(case, phase_meta)
+        t_duration = _scalar_item(case.get_val(f"{phase_meta['promoted_path']}.t_duration"))
+        ptau = np.asarray(node_ptau, dtype=float)
+        return t_initial + 0.5 * (ptau + 1.0) * t_duration
+
+    def _state_marker_trace(self, case, phase_meta, variable):
+        phase_path = phase_meta["promoted_path"]
+        try:
+            yraw = np.asarray(case.get_val(f"{phase_path}.states:{variable}"))
+        except Exception:
+            return None, None
+
+        node_ptau = phase_meta.get("state_input_node_ptau")
+        if node_ptau is None:
+            return self._marker_trace(case, phase_meta, f"timeseries.states:{variable}")
+
+        xvals = self._phase_time_from_ptau(case, phase_meta, node_ptau)
+        yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, _ = _collapse_repeated_samples(xvals, yvals)
+        return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float)
+
+    def _control_marker_trace(self, case, phase_meta, variable):
+        phase_path = phase_meta["promoted_path"]
+        try:
+            yraw = np.asarray(case.get_val(f"{phase_path}.controls:{variable}"))
+        except Exception:
+            return None, None
+
+        node_ptau = phase_meta.get("control_input_node_ptau")
+        if node_ptau is None:
+            return self._marker_trace(case, phase_meta, f"timeseries.controls:{variable}")
+
+        xvals = self._phase_time_from_ptau(case, phase_meta, node_ptau)
+        yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, _ = _collapse_repeated_samples(xvals, yvals)
+        return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float)
+
     def _marker_trace(self, case, phase_meta, relative_path):
         phase_path = phase_meta["promoted_path"]
         path = relative_path if relative_path.startswith(phase_path) else f"{phase_path}.{relative_path}"
@@ -556,6 +672,7 @@ class _TrajectoryTab:
             return None, None
         xvals = self._timeseries_xvals(case, phase_meta, yraw.shape[0])
         yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, _ = _collapse_repeated_samples(xvals, yvals)
         return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float)
 
     def _timeseries_xvals(self, case, phase_meta, count):
@@ -680,12 +797,38 @@ class _SeriesTab:
                 renderer.visible = False
             self._source.data = dict(iteration=[])
             return
-        iterations = [snapshot.major_iteration for snapshot in self._broker.snapshots]
-        data = {"iteration": iterations}
         group_key = self._GROUP_LABEL_TO_KEY.get(self._group_select.value, "scaled_objs")
-        for name in selected:
-            series = self._broker.get_series(group_key, name)
-            data[name] = [_scalar_for_plot(item) for item in series]
+        if group_key == "opt_history":
+            history_entries = self._broker.get_history_entries()
+            iterations = []
+            data = {"iteration": iterations}
+            for idx, entry in enumerate(history_entries, start=1):
+                iter_value = entry.get("iter", idx)
+                iterations.append(_scalar_item(iter_value) if np.asarray(iter_value).size else float(idx))
+            for name in selected:
+                values = []
+                for entry in history_entries:
+                    if name not in entry:
+                        continue
+                    values.append(_scalar_for_plot(entry[name]))
+                data[name] = values
+            warning = self._broker.get_history_warning()
+            if not self._broker.get_history_keys():
+                warning = "No pyOptSparse .hst file available, so optimizer diagnostics are unavailable."
+            elif len(self._broker.snapshots) != len(history_entries):
+                warning = (
+                    "Optimizer history is plotted on its own iteration axis because its row count "
+                    "diverged from OpenMDAO driver cases."
+                )
+            self._warning.text = warning or ""
+        else:
+            iterations = [snapshot.major_iteration for snapshot in self._broker.snapshots]
+            data = {"iteration": iterations}
+            for name in selected:
+                series = self._broker.get_series(group_key, name)
+                data[name] = [_scalar_for_plot(item) for item in series]
+            warning = self._broker.get_history_warning()
+            self._warning.text = warning or ""
         self._source.data = data
         existing = set(self._renderers)
         for idx, name in enumerate(selected):
@@ -704,10 +847,6 @@ class _SeriesTab:
         for name in existing - set(selected):
             self._renderers[name].visible = False
         _ensure_figure_legend(self._figure)
-        warning = self._broker.get_history_warning()
-        if group_key == "opt_history" and not self._broker.get_history_keys():
-            warning = "No pyOptSparse .hst file available, so optimizer diagnostics are unavailable."
-        self._warning.text = warning or ""
 
 
 class _JacobianEntriesTab:
@@ -761,10 +900,10 @@ class _JacobianEntriesTab:
         self.refresh(force=True)
 
     def _latest_derivatives(self):
-        snapshot = self._broker.latest_snapshot()
-        if snapshot is None:
-            return None
-        return snapshot.derivatives
+        for snapshot in reversed(self._broker.snapshots):
+            if snapshot.derivatives is not None:
+                return snapshot.derivatives
+        return None
 
     def refresh(self, force=False):
         if not self._broker.snapshots:
@@ -864,16 +1003,17 @@ class _JacobianEntriesTab:
             for renderer in self._renderers.values():
                 renderer.visible = False
             return
-        data = {"iteration": [snapshot.major_iteration for snapshot in self._broker.snapshots]}
+        derivative_snapshots = [
+            snapshot for snapshot in self._broker.snapshots
+            if snapshot.derivatives is not None and block_key in snapshot.derivatives
+        ]
+        data = {"iteration": [snapshot.major_iteration for snapshot in derivative_snapshots]}
         use_log = 0 in self._log_check.active
         for label in selected:
             idx = ever_nonzero[label]
             values = []
-            for snapshot in self._broker.snapshots:
+            for snapshot in derivative_snapshots:
                 derivs = snapshot.derivatives
-                if derivs is None or block_key not in derivs:
-                    values.append(np.nan)
-                    continue
                 arr = np.asarray(derivs[block_key])
                 if arr.ndim == 1:
                     arr = arr[:, np.newaxis]
@@ -881,6 +1021,7 @@ class _JacobianEntriesTab:
                 values.append(math.log10(abs(value)) if use_log and abs(value) > 0.0 else value)
             data[label] = values
         self._source.data = data
+        missing_count = len(self._broker.snapshots) - len(derivative_snapshots)
 
         existing = set(self._renderers)
         for idx, label in enumerate(selected):
@@ -899,7 +1040,13 @@ class _JacobianEntriesTab:
         for label in existing - set(selected):
             self._renderers[label].visible = False
         _ensure_figure_legend(self._figure)
-        self._warning.text = ""
+        if missing_count > 0:
+            self._warning.text = (
+                f"Showing {len(derivative_snapshots)} iterations with recorded derivatives; "
+                f"{missing_count} driver iterations had no derivative block for this view."
+            )
+        else:
+            self._warning.text = ""
 
 
 class _JacobianHeatmapTab:
@@ -917,7 +1064,17 @@ class _JacobianHeatmapTab:
             output_backend="webgl",
             tooltips=[("entry", "@label"), ("sym-log", "@value")],
         )
+        self._row_highlight_source = ColumnDataSource(data=dict(left=[], right=[], bottom=[], top=[], color=[], kind=[]))
+        self._col_highlight_source = ColumnDataSource(data=dict(left=[], right=[], bottom=[], top=[], color=[], kind=[]))
         self._figure.rect(x="x", y="y", width=1, height=1, source=self._source, fill_color={"field": "value", "transform": self._mapper}, line_color=None)
+        self._figure.quad(
+            left="left", right="right", bottom="bottom", top="top",
+            source=self._row_highlight_source, fill_color="color", fill_alpha=0.18, line_color=None
+        )
+        self._figure.quad(
+            left="left", right="right", bottom="bottom", top="top",
+            source=self._col_highlight_source, fill_color="color", fill_alpha=0.14, line_color=None
+        )
         self.panel = TabPanel(
             child=column(self._warning, self._stats, self._figure, sizing_mode="stretch_both"),
             title=DASHBOARD_TAB_TITLES[JACOBIAN_HEATMAP_TAB],
@@ -947,20 +1104,34 @@ class _JacobianHeatmapTab:
         label = []
         row_cursor = 0
         row_map = {}
+        row_sizes = {}
         for of, wrt, block in blocks:
             row_start = row_map.setdefault(of, row_cursor)
             if row_start == row_cursor:
+                row_sizes[of] = block.shape[0]
                 row_cursor += block.shape[0]
         nrows = row_cursor
 
         col_cursor = 0
         col_map = {}
+        col_sizes = {}
         for of, wrt, block in blocks:
             col_start = col_map.setdefault(wrt, col_cursor)
             if col_start == col_cursor:
+                col_sizes[wrt] = block.shape[1]
                 col_cursor += block.shape[1]
         ncols = col_cursor
         dense = np.zeros((nrows, ncols))
+        row_labels = [None] * nrows
+        col_labels = [None] * ncols
+        for of, row_start in row_map.items():
+            size = row_sizes[of]
+            for idx in range(size):
+                row_labels[row_start + idx] = f"{of}[{idx}]"
+        for wrt, col_start in col_map.items():
+            size = col_sizes[wrt]
+            for idx in range(size):
+                col_labels[col_start + idx] = f"{wrt}[{idx}]"
 
         for of, wrt, block in blocks:
             row_start = row_map[of]
@@ -994,10 +1165,65 @@ class _JacobianHeatmapTab:
                 prev_dense[row_map[of]:row_map[of] + prev_block.shape[0], col_map[wrt]:col_map[wrt] + prev_block.shape[1]] = prev_block
             break
 
-        rank = int(np.linalg.matrix_rank(dense)) if dense.size else 0
-        cond = float(np.linalg.cond(dense)) if dense.size else float("nan")
+        rank, cond = _matrix_rank_and_condition(dense)
         nnz = int(np.count_nonzero(np.abs(dense) > _ZERO_JAC_THRESHOLD))
         density = nnz / dense.size if dense.size else 0.0
+        row_norms = np.linalg.norm(dense, axis=1) if dense.size else np.array([], dtype=float)
+        col_norms = np.linalg.norm(dense, axis=0) if dense.size else np.array([], dtype=float)
+        zero_row_idx = [idx for idx, norm in enumerate(row_norms) if norm <= _ZERO_JAC_THRESHOLD]
+        zero_col_idx = [idx for idx, norm in enumerate(col_norms) if norm <= _ZERO_JAC_THRESHOLD]
+        dep_row_idx = [idx for idx in _dependent_indices(dense, "rows") if idx not in zero_row_idx]
+        dep_col_idx = [idx for idx in _dependent_indices(dense, "columns") if idx not in zero_col_idx]
+        zero_row_labels = [row_labels[idx] for idx in zero_row_idx]
+        zero_col_labels = [col_labels[idx] for idx in zero_col_idx]
+        dep_row_labels = [row_labels[idx] for idx in dep_row_idx]
+        dep_col_labels = [col_labels[idx] for idx in dep_col_idx]
+        row_left = []
+        row_right = []
+        row_bottom = []
+        row_top = []
+        row_color = []
+        row_kind = []
+        for idx in zero_row_idx:
+            row_left.append(0.0)
+            row_right.append(float(ncols))
+            row_bottom.append(float(idx))
+            row_top.append(float(idx + 1))
+            row_color.append("#d62728")
+            row_kind.append("zero-row")
+        for idx in dep_row_idx:
+            row_left.append(0.0)
+            row_right.append(float(ncols))
+            row_bottom.append(float(idx))
+            row_top.append(float(idx + 1))
+            row_color.append("#ff7f0e")
+            row_kind.append("dependent-row")
+        col_left = []
+        col_right = []
+        col_bottom = []
+        col_top = []
+        col_color = []
+        col_kind = []
+        for idx in zero_col_idx:
+            col_left.append(float(idx))
+            col_right.append(float(idx + 1))
+            col_bottom.append(0.0)
+            col_top.append(float(nrows))
+            col_color.append("#9467bd")
+            col_kind.append("zero-col")
+        for idx in dep_col_idx:
+            col_left.append(float(idx))
+            col_right.append(float(idx + 1))
+            col_bottom.append(0.0)
+            col_top.append(float(nrows))
+            col_color.append("#17becf")
+            col_kind.append("dependent-col")
+        self._row_highlight_source.data = dict(
+            left=row_left, right=row_right, bottom=row_bottom, top=row_top, color=row_color, kind=row_kind
+        )
+        self._col_highlight_source.data = dict(
+            left=col_left, right=col_right, bottom=col_bottom, top=col_top, color=col_color, kind=col_kind
+        )
         if prev_dense is None:
             delta_norm = float("nan")
             max_delta = float("nan")
@@ -1005,11 +1231,23 @@ class _JacobianHeatmapTab:
             delta = dense - prev_dense
             delta_norm = float(np.linalg.norm(delta))
             max_delta = float(np.max(np.abs(delta)))
+        cond_text = "inf" if math.isinf(cond) else f"{cond:.3e}"
         self._stats.text = (
             f"shape={dense.shape}, nnz={nnz}, density={density:.4f}, rank={rank}, "
-            f"cond={cond:.3e}, frob_delta={delta_norm:.3e}, max_abs_delta={max_delta:.3e}"
+            f"cond={cond_text}, frob_delta={delta_norm:.3e}, max_abs_delta={max_delta:.3e}"
         )
-        self._warning.text = ""
+        warning_parts = []
+        if math.isinf(cond):
+            warning_parts.append("Jacobian appears singular or numerically rank deficient; condition number is infinite.")
+        if zero_row_labels:
+            warning_parts.append(f"Zero rows: {_format_suspicious_labels(zero_row_labels)}")
+        if zero_col_labels:
+            warning_parts.append(f"Zero columns: {_format_suspicious_labels(zero_col_labels)}")
+        if dep_row_labels:
+            warning_parts.append(f"Dependent rows: {_format_suspicious_labels(dep_row_labels)}")
+        if dep_col_labels:
+            warning_parts.append(f"Dependent columns: {_format_suspicious_labels(dep_col_labels)}")
+        self._warning.text = " ".join(warning_parts)
 
 
 class _RealTimeDymosDashboard:
@@ -1051,26 +1289,34 @@ class _RealTimeDymosDashboard:
             self._tab_rendered[active_name] = True
 
     def _update(self):
-        self._tab_objects[CASE_PLOTTER_TAB]._update_wrapped_in_try()
-        new_snapshots = self._broker.poll()
+        try:
+            self._tab_objects[CASE_PLOTTER_TAB]._update_wrapped_in_try()
+            new_snapshots = self._broker.poll()
+        except Exception as exc:
+            print(f"Dashboard update will retry after refresh error: {exc}")
+            return
         if not new_snapshots and not self._broker.is_running():
             return
         if not self._broker.snapshots:
             return
 
-        active = self._tabs.active
-        self._tab_objects[TRAJECTORY_TAB].refresh()
-        self._tab_objects[SERIES_TAB].refresh()
-        latest_iter = self._broker.latest_snapshot().major_iteration
-        active_changed = active != self._last_active
-        active_name = DASHBOARD_TAB_ORDER[active]
-        heavy_allowed = active_name in _HEAVY_TABS and (
-            active_changed or len(new_snapshots) > 0 or latest_iter % _HEAVY_TAB_STRIDE == 0
-        )
-        if heavy_allowed:
-            self._tab_objects[active_name].refresh(force=True)
-            self._tab_rendered[active_name] = True
-        self._last_active = active
+        try:
+            active = self._tabs.active
+            self._tab_objects[TRAJECTORY_TAB].refresh()
+            self._tab_objects[SERIES_TAB].refresh()
+            latest_iter = self._broker.latest_snapshot().major_iteration
+            active_changed = active != self._last_active
+            active_name = DASHBOARD_TAB_ORDER[active]
+            heavy_allowed = active_name in _HEAVY_TABS and (
+                active_changed or len(new_snapshots) > 0 or latest_iter % _HEAVY_TAB_STRIDE == 0
+            )
+            if heavy_allowed:
+                self._tab_objects[active_name].refresh(force=True)
+                self._tab_rendered[active_name] = True
+            self._last_active = active
+        except Exception as exc:
+            print(f"Dashboard tab refresh will retry after refresh error: {exc}")
+            return
 
 
 def _build_dashboard_tab(tab_name, case_tracker, callback_period, doc, pid_of_calling_script, script, broker=None):
@@ -1121,9 +1367,16 @@ class _StandaloneDashboardTabApp:
         self._doc.title = f"Dymos RTPlot - {DASHBOARD_TAB_TITLES[tab_name]}"
 
     def _update(self):
-        new_snapshots = self._broker.poll()
-        if not new_snapshots and not self._broker.is_running():
+        try:
+            new_snapshots = self._broker.poll()
+            if not new_snapshots and not self._broker.is_running():
+                return
+            if not self._broker.snapshots:
+                return
+            self._tab.refresh(force=self._tab_name in _HEAVY_TABS)
+        except Exception as exc:
+            print(
+                f"Standalone {DASHBOARD_TAB_TITLES[self._tab_name]} tab will retry "
+                f"after refresh error: {exc}"
+            )
             return
-        if not self._broker.snapshots:
-            return
-        self._tab.refresh(force=self._tab_name in _HEAVY_TABS)
