@@ -36,7 +36,7 @@ def _resolve_phase_var_path(phase_promoted_path, relative_path):
     return f'{phase_promoted_path}.{relative_path}'
 
 
-def _aligned_dense_state_matrices(grid_data, output_grid_data):
+def _aligned_dense_lgl_state_matrices(grid_data, output_grid_data):
     ai_blocks = []
     bi_blocks = []
     ad_blocks = []
@@ -58,10 +58,35 @@ def _aligned_dense_state_matrices(grid_data, output_grid_data):
         bd_blocks.append(bd_seg)
 
     return {
+        'mode': 'hermite',
         'Ai': block_diag(*ai_blocks).tolist(),
         'Bi': block_diag(*bi_blocks).tolist(),
         'Ad': block_diag(*ad_blocks).tolist(),
         'Bd': block_diag(*bd_blocks).tolist(),
+    }
+
+
+def _aligned_dense_radau_state_matrices(grid_data, output_grid_data):
+    l_blocks = []
+    d_blocks = []
+
+    for iseg in range(grid_data.num_segments):
+        i1, i2 = grid_data.subset_segment_indices['state_disc'][iseg, :]
+        disc_indices = grid_data.subset_node_indices['state_disc'][i1:i2]
+        nodes_given = grid_data.node_stau[disc_indices]
+
+        i1, i2 = output_grid_data.subset_segment_indices['all'][iseg, :]
+        eval_indices = output_grid_data.subset_node_indices['all'][i1:i2]
+        nodes_eval = output_grid_data.node_stau[eval_indices]
+
+        l_seg, d_seg = lagrange_matrices(nodes_given, nodes_eval)
+        l_blocks.append(l_seg)
+        d_blocks.append(d_seg)
+
+    return {
+        'mode': 'lagrange',
+        'L': block_diag(*l_blocks).tolist(),
+        'D': block_diag(*d_blocks).tolist(),
     }
 
 
@@ -96,6 +121,31 @@ def _aligned_dense_control_matrices(grid_data, output_grid_data):
         'D': (d_da.dot(l_id)).tolist(),
         'D2': (d_da.dot(d_dd.dot(l_id))).tolist(),
     }
+
+
+def _aligned_dense_state_matrices(grid_data, output_grid_data):
+    transcription = getattr(grid_data, 'transcription', None)
+    if transcription == 'gauss-lobatto':
+        return _aligned_dense_lgl_state_matrices(grid_data, output_grid_data)
+    if transcription in ('radau-ps', 'birkhoff'):
+        return _aligned_dense_radau_state_matrices(grid_data, output_grid_data)
+    return None
+
+
+def _supports_exact_state_interp(transcription):
+    cls_name = type(transcription).__name__
+    return cls_name in {'GaussLobatto', 'Radau', 'RadauNew', 'Birkhoff'}
+
+
+def _supports_exact_control_interp(grid_data):
+    try:
+        return (
+            'control_disc' in grid_data.subset_num_nodes
+            and 'control_input' in grid_data.subset_num_nodes
+            and 'dynamic_control_input_to_disc' in grid_data.input_maps
+        )
+    except Exception:
+        return False
 
 
 def _constraint_to_meta(constraint_name, constraint_data):
@@ -153,7 +203,15 @@ def _timeseries_output_meta(phase):
 
 def _state_rate_metadata(phase, state_name):
     transcription = phase.options['transcription']
-    rate_path, src_idxs = transcription._get_rate_source_path(state_name, nodes='state_disc', phase=phase)
+    try:
+        rate_path, src_idxs = transcription._get_rate_source_path(state_name, nodes='state_disc', phase=phase)
+    except TypeError:
+        try:
+            rate_path, src_idxs = transcription._get_rate_source_path(state_name, phase=phase)
+        except Exception:
+            return None
+    except Exception:
+        return None
     phase_path = _phase_promoted_path(phase)
     rows = list(range(len(src_idxs[0]))) if isinstance(src_idxs, tuple) else None
 
@@ -227,6 +285,7 @@ def build_rtplot_metadata(problem, case_recorder_filename):
                 'pathname': phase.pathname,
                 'promoted_path': _phase_promoted_path(phase),
                 'transcription': type(transcription).__name__,
+                'transcription_name': getattr(grid_data, 'transcription', None),
                 'grid_type': getattr(grid_data, 'grid_type', None),
                 'segment_ends': grid_data.segment_ends.tolist(),
                 'compressed': bool(grid_data.compressed),
@@ -248,8 +307,12 @@ def build_rtplot_metadata(problem, case_recorder_filename):
                 },
             }
 
-            if getattr(grid_data, 'grid_type', None) == 'lgl':
-                phase_meta['state_interp'] = _aligned_dense_state_matrices(grid_data, output_grid)
+            state_interp = None
+            if _supports_exact_state_interp(transcription):
+                state_interp = _aligned_dense_state_matrices(grid_data, output_grid)
+            if state_interp is not None:
+                phase_meta['state_interp'] = state_interp
+            if _supports_exact_control_interp(grid_data):
                 phase_meta['control_interp'] = _aligned_dense_control_matrices(grid_data, output_grid)
 
             for state_name, options in phase.state_options.items():
