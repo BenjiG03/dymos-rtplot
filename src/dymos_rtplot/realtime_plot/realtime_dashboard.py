@@ -34,6 +34,39 @@ _HEAVY_TAB_STRIDE = 5
 _ZERO_JAC_THRESHOLD = 1.0e-16
 _DEFAULT_LINE_COLORS = Category20[20]
 _PHASE_COLORS = Category10[10]
+CASE_PLOTTER_TAB = "case-plotter"
+TRAJECTORY_TAB = "trajectory"
+SERIES_TAB = "series"
+JACOBIAN_ENTRIES_TAB = "jacobian-entries"
+JACOBIAN_HEATMAP_TAB = "jacobian-heatmap"
+DASHBOARD_TAB_ORDER = (
+    CASE_PLOTTER_TAB,
+    TRAJECTORY_TAB,
+    SERIES_TAB,
+    JACOBIAN_ENTRIES_TAB,
+    JACOBIAN_HEATMAP_TAB,
+)
+DASHBOARD_TAB_TITLES = {
+    CASE_PLOTTER_TAB: "Case Plotter",
+    TRAJECTORY_TAB: "Trajectory",
+    SERIES_TAB: "Scaled + Opt",
+    JACOBIAN_ENTRIES_TAB: "Jacobian Entries",
+    JACOBIAN_HEATMAP_TAB: "Jacobian Heatmap",
+}
+_HEAVY_TABS = {JACOBIAN_ENTRIES_TAB, JACOBIAN_HEATMAP_TAB}
+
+
+def get_dashboard_tab_names():
+    return list(DASHBOARD_TAB_ORDER)
+
+
+def _ensure_figure_legend(fig):
+    if not fig.legend:
+        return
+    legend = fig.legend[0]
+    legend.visible = True
+    legend.location = "top_left"
+    legend.click_policy = "hide"
 
 
 def _flatten(arr):
@@ -131,7 +164,7 @@ class _TrajectoryTab:
         controls = row(self._traj_select, *order_controls, self._display_check, sizing_mode="stretch_width")
         self.panel = TabPanel(
             child=column(self._status, self._warning, controls, self._plots_scroll, sizing_mode="stretch_both"),
-            title="Trajectory",
+            title=DASHBOARD_TAB_TITLES[TRAJECTORY_TAB],
         )
 
     def _ensure_initialized(self):
@@ -224,7 +257,7 @@ class _TrajectoryTab:
             return
 
         ordered_categories = self._selected_order()
-        if ordered_categories == self._last_order and self._plots_column.children and not isinstance(self._plots_column.children[0], Div):
+        if ordered_categories == self._last_order and self._plots_column.children:
             return
 
         children = []
@@ -601,7 +634,10 @@ class _SeriesTab:
         self._group_select.on_change("value", self._selection_changed)
         self._var_select.on_change("value", self._selection_changed)
         controls = row(self._group_select, self._var_select, sizing_mode="stretch_width")
-        self.panel = TabPanel(child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"), title="Scaled + Opt")
+        self.panel = TabPanel(
+            child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"),
+            title=DASHBOARD_TAB_TITLES[SERIES_TAB],
+        )
 
     def _selection_changed(self, attr, old, new):
         if self._updating_widgets:
@@ -667,7 +703,7 @@ class _SeriesTab:
             self._renderers[name].visible = True
         for name in existing - set(selected):
             self._renderers[name].visible = False
-        self._figure.legend.click_policy = "hide"
+        _ensure_figure_legend(self._figure)
         warning = self._broker.get_history_warning()
         if group_key == "opt_history" and not self._broker.get_history_keys():
             warning = "No pyOptSparse .hst file available, so optimizer diagnostics are unavailable."
@@ -698,7 +734,10 @@ class _JacobianEntriesTab:
         self._entry_select.on_change("value", self._entry_changed)
         self._log_check.on_change("active", self._log_changed)
         controls = row(self._block_select, self._entry_select, self._log_check, sizing_mode="stretch_width")
-        self.panel = TabPanel(child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"), title="Jacobian Entries")
+        self.panel = TabPanel(
+            child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"),
+            title=DASHBOARD_TAB_TITLES[JACOBIAN_ENTRIES_TAB],
+        )
 
     def _block_changed(self, attr, old, new):
         if self._updating_widgets:
@@ -859,6 +898,7 @@ class _JacobianEntriesTab:
             self._renderers[label].visible = True
         for label in existing - set(selected):
             self._renderers[label].visible = False
+        _ensure_figure_legend(self._figure)
         self._warning.text = ""
 
 
@@ -878,7 +918,10 @@ class _JacobianHeatmapTab:
             tooltips=[("entry", "@label"), ("sym-log", "@value")],
         )
         self._figure.rect(x="x", y="y", width=1, height=1, source=self._source, fill_color={"field": "value", "transform": self._mapper}, line_color=None)
-        self.panel = TabPanel(child=column(self._warning, self._stats, self._figure, sizing_mode="stretch_both"), title="Jacobian Heatmap")
+        self.panel = TabPanel(
+            child=column(self._warning, self._stats, self._figure, sizing_mode="stretch_both"),
+            title=DASHBOARD_TAB_TITLES[JACOBIAN_HEATMAP_TAB],
+        )
 
     def refresh(self, force=False):
         if not self._broker.snapshots:
@@ -975,24 +1018,23 @@ class _RealTimeDymosDashboard:
         self._doc = doc
         self._pid = pid_of_calling_script
         self._last_active = 0
-        self._tab4_rendered = False
-        self._tab5_rendered = False
-        self._optimizer_plot = _RealTimeOptimizerPlot(
-            case_tracker,
-            callback_period,
-            doc,
-            pid_of_calling_script,
-            script,
-            add_root=False,
-            start_callback=False,
-        )
-        self._tab1 = TabPanel(child=self._optimizer_plot.layout, title="Current RTPlot")
-        self._tab2 = _TrajectoryTab(self._broker)
-        self._tab3 = _SeriesTab(self._broker)
-        self._tab4 = _JacobianEntriesTab(self._broker)
-        self._tab5 = _JacobianHeatmapTab(self._broker)
+        self._tab_rendered = {name: False for name in _HEAVY_TABS}
+        self._tab_objects = {}
+        self._tab_panels = []
+        for tab_name in DASHBOARD_TAB_ORDER:
+            tab_obj, panel = _build_dashboard_tab(
+                tab_name,
+                case_tracker,
+                callback_period,
+                doc,
+                pid_of_calling_script,
+                script,
+                broker=self._broker,
+            )
+            self._tab_objects[tab_name] = tab_obj
+            self._tab_panels.append(panel)
         self._tabs = Tabs(
-            tabs=[self._tab1, self._tab2.panel, self._tab3.panel, self._tab4.panel, self._tab5.panel],
+            tabs=self._tab_panels,
             sizing_mode="stretch_both",
         )
         self._tabs.on_change("active", self._active_tab_changed)
@@ -1001,15 +1043,15 @@ class _RealTimeDymosDashboard:
         self._doc.title = "Dymos RTPlot Dashboard"
 
     def _active_tab_changed(self, attr, old, new):
-        if new == 3 and self._broker.snapshots:
-            self._tab4.refresh(force=True)
-            self._tab4_rendered = True
-        elif new == 4 and self._broker.snapshots:
-            self._tab5.refresh(force=True)
-            self._tab5_rendered = True
+        if not self._broker.snapshots:
+            return
+        active_name = DASHBOARD_TAB_ORDER[new]
+        if active_name in _HEAVY_TABS:
+            self._tab_objects[active_name].refresh(force=True)
+            self._tab_rendered[active_name] = True
 
     def _update(self):
-        self._optimizer_plot._update_wrapped_in_try()
+        self._tab_objects[CASE_PLOTTER_TAB]._update_wrapped_in_try()
         new_snapshots = self._broker.poll()
         if not new_snapshots and not self._broker.is_running():
             return
@@ -1017,18 +1059,71 @@ class _RealTimeDymosDashboard:
             return
 
         active = self._tabs.active
-        self._tab2.refresh()
-        self._tab3.refresh()
+        self._tab_objects[TRAJECTORY_TAB].refresh()
+        self._tab_objects[SERIES_TAB].refresh()
         latest_iter = self._broker.latest_snapshot().major_iteration
         active_changed = active != self._last_active
-        heavy_allowed = active in (3, 4) and (
+        active_name = DASHBOARD_TAB_ORDER[active]
+        heavy_allowed = active_name in _HEAVY_TABS and (
             active_changed or len(new_snapshots) > 0 or latest_iter % _HEAVY_TAB_STRIDE == 0
         )
         if heavy_allowed:
-            if active == 3:
-                self._tab4.refresh(force=True)
-                self._tab4_rendered = True
-            elif active == 4:
-                self._tab5.refresh(force=True)
-                self._tab5_rendered = True
+            self._tab_objects[active_name].refresh(force=True)
+            self._tab_rendered[active_name] = True
         self._last_active = active
+
+
+def _build_dashboard_tab(tab_name, case_tracker, callback_period, doc, pid_of_calling_script, script, broker=None):
+    if tab_name == CASE_PLOTTER_TAB:
+        plot = _RealTimeOptimizerPlot(
+            case_tracker,
+            callback_period,
+            doc,
+            pid_of_calling_script,
+            script,
+            add_root=False,
+            start_callback=False,
+        )
+        return plot, TabPanel(child=plot.layout, title=DASHBOARD_TAB_TITLES[CASE_PLOTTER_TAB])
+
+    if broker is None:
+        raise ValueError("A broker is required for non-case-plotter dashboard tabs.")
+    if tab_name == TRAJECTORY_TAB:
+        tab = _TrajectoryTab(broker)
+    elif tab_name == SERIES_TAB:
+        tab = _SeriesTab(broker)
+    elif tab_name == JACOBIAN_ENTRIES_TAB:
+        tab = _JacobianEntriesTab(broker)
+    elif tab_name == JACOBIAN_HEATMAP_TAB:
+        tab = _JacobianHeatmapTab(broker)
+    else:
+        raise KeyError(f"Unknown dashboard tab: {tab_name}")
+
+    return tab, tab.panel
+
+
+class _StandaloneDashboardTabApp:
+    def __init__(self, tab_name, case_tracker, callback_period, doc, pid_of_calling_script, script, metadata=None, hist_file=None):
+        self._tab_name = tab_name
+        self._broker = LiveDataBroker(case_tracker, metadata=metadata, hist_file=hist_file)
+        self._doc = doc
+        self._tab, panel = _build_dashboard_tab(
+            tab_name,
+            case_tracker,
+            callback_period,
+            doc,
+            pid_of_calling_script,
+            script,
+            broker=self._broker,
+        )
+        self._doc.add_root(panel.child)
+        self._doc.add_periodic_callback(self._update, callback_period)
+        self._doc.title = f"Dymos RTPlot - {DASHBOARD_TAB_TITLES[tab_name]}"
+
+    def _update(self):
+        new_snapshots = self._broker.poll()
+        if not new_snapshots and not self._broker.is_running():
+            return
+        if not self._broker.snapshots:
+            return
+        self._tab.refresh(force=self._tab_name in _HEAVY_TABS)
