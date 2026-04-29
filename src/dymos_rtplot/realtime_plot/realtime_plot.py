@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import openmdao.api as om
 from openmdao.recorders.sqlite_reader import SqliteCaseReader
 from openmdao.recorders.case import Case
 from openmdao.utils import hooks
@@ -219,11 +218,6 @@ def _rtplot_cmd(options, user_args):
             driver = problem.driver
             if not driver:
                 return
-            if len(driver._rec_mgr._recorders) == 0:
-                auto_case_path = Path(file_path).resolve().with_name(
-                    f"{Path(file_path).stem}_rtplot_auto_{os.getpid()}.sqlite"
-                )
-                driver.add_recorder(om.SqliteRecorder(str(auto_case_path)))
             driver.recording_options['record_outputs'] = True
             driver.recording_options['record_derivatives'] = True
             driver.recording_options['includes'] = ['*']
