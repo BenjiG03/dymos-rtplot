@@ -6,8 +6,10 @@ import os
 import sqlite3
 import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 
+import openmdao.api as om
 from openmdao.recorders.sqlite_reader import SqliteCaseReader
 from openmdao.recorders.case import Case
 from openmdao.utils import hooks
@@ -73,6 +75,17 @@ def _realtime_plot_setup_parser(parser):
                         help='Optional metadata sidecar for the richer dashboard.')
     parser.add_argument('--hist-file', type=str, default=None,
                         help='Optional pyOptSparse history file.')
+    parser.add_argument(
+        '--open-browser',
+        action='store_true',
+        help='Attempt to open the dashboard URL in the system browser.',
+    )
+    parser.add_argument(
+        '--host',
+        type=str,
+        default='127.0.0.1',
+        help='Host interface to bind the Bokeh server to. Defaults to 127.0.0.1.',
+    )
 
 
 def _realtime_plot_cmd(options, user_args):
@@ -94,6 +107,8 @@ def _realtime_plot_cmd(options, user_args):
             options.script,
             options.meta_file,
             options.hist_file,
+            options.open_browser,
+            options.host,
         )
     else:
         print(
@@ -156,6 +171,7 @@ def _rtplot_cmd(options, user_args):
 
         cmd = [sys.executable, '-m', 'dymos_rtplot.rtplot',
                'realtime_plot', '--pid', str(os.getpid()),
+               '--host', '127.0.0.1',
                '--meta-file', str(meta_path),
                case_recorder_file]
         if hist_file:
@@ -187,6 +203,8 @@ def _rtplot_cmd(options, user_args):
             "realtime_plot",
             "--pid",
             str(os.getpid()),
+            "--host",
+            "127.0.0.1",
             case_recorder_file,
         ]
         if meta_path:
@@ -218,6 +236,11 @@ def _rtplot_cmd(options, user_args):
             driver = problem.driver
             if not driver:
                 return
+            if len(driver._rec_mgr._recorders) == 0:
+                auto_case_path = Path(file_path).resolve().with_name(
+                    f"{Path(file_path).stem}_rtplot_auto_{os.getpid()}.sqlite"
+                )
+                driver.add_recorder(om.SqliteRecorder(str(auto_case_path)))
             driver.recording_options['record_outputs'] = True
             driver.recording_options['record_derivatives'] = True
             driver.recording_options['includes'] = ['*']
@@ -401,7 +424,8 @@ class _CaseRecorderTracker:
 
 
 def realtime_plot(case_recorder_filename, callback_period,
-                  pid_of_calling_script, script, meta_file=None, hist_file=None):
+                  pid_of_calling_script, script, meta_file=None, hist_file=None,
+                  open_browser=False, host='127.0.0.1'):
     """
     Visualize the objectives, desvars, and constraints during an optimization or analysis process.
 
@@ -416,6 +440,8 @@ def realtime_plot(case_recorder_filename, callback_period,
     script : str or None
         If not None, the file path of the script that created the case recorder file.
     """
+    server = None
+
     def _make_realtime_plot_doc(doc):
         print(f"Creating realtime plot document for {case_recorder_filename}")
         case_tracker = _CaseRecorderTracker(case_recorder_filename)
@@ -441,11 +467,14 @@ def realtime_plot(case_recorder_filename, callback_period,
             )
 
     _port_number = get_free_port()
+    app_url = f"http://{host}:{_port_number}/"
 
     try:
         server = Server(
             {"/": Application(FunctionHandler(_make_realtime_plot_doc))},
+            address=host,
             port=_port_number,
+            allow_websocket_origin=[f"{host}:{_port_number}"],
             unused_session_lifetime_milliseconds=_unused_session_lifetime_milliseconds,
             extra_patterns=[
                 (
@@ -460,7 +489,17 @@ def realtime_plot(case_recorder_filename, callback_period,
         testflo_running = os.environ.pop('TESTFLO_RUNNING', None)
 
         if not testflo_running:
-            server.io_loop.add_callback(server.show, "/")
+            if open_browser:
+                def _open_browser():
+                    try:
+                        opened = webbrowser.open_new_tab(app_url)
+                    except Exception as err:
+                        print(f"Automatic browser launch failed: {err}")
+                        opened = False
+                    if not opened:
+                        print(f"Open this URL manually in a browser: {app_url}")
+
+                server.io_loop.add_callback(_open_browser)
         else:
             # for testing, we are, for now, just testing that the command runs.
             # So can stop the plot process right away
@@ -471,8 +510,10 @@ def realtime_plot(case_recorder_filename, callback_period,
             periodic_callback.start()
 
         print(
-            f"Real-time optimization plot server running on http://localhost:{_port_number}"
+            f"Real-time optimization plot server running on {app_url}"
         )
+        if not open_browser and not testflo_running:
+            print(f"Open this URL manually in a browser: {app_url}")
         server.io_loop.start()
     except KeyboardInterrupt as e:
         print(
@@ -482,5 +523,5 @@ def realtime_plot(case_recorder_filename, callback_period,
         print(f"Error starting real-time optimization plot server: {e}")
     finally:
         print("Stopping real-time optimization plot server")
-        if "server" in globals():
+        if server is not None:
             server.stop()
