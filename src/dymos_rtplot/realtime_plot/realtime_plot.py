@@ -44,6 +44,7 @@ try:
     from bokeh.server.server import Server
     from bokeh.application.application import Application
     from bokeh.application.handlers import FunctionHandler
+    from bokeh.themes import Theme
     from tornado.ioloop import PeriodicCallback
     from tornado.web import StaticFileHandler
 
@@ -67,6 +68,52 @@ _MULTIWINDOW_STARTUP_TIMEOUT = 30.0
 _DEFAULT_MULTIWINDOW_BASE_PORT = 57003
 _CHILD_IDLE_SHUTDOWN_SECONDS = 15.0
 _CHILD_IDLE_CHECK_PERIOD_MS = 1000
+_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE = True
+_DARK_THEME_JSON = {
+    "attrs": {
+        "figure": {
+            "background_fill_color": "#10141f",
+            "border_fill_color": "#10141f",
+            "outline_line_color": "#374151",
+        },
+        "Grid": {
+            "grid_line_color": "#243042",
+            "grid_line_alpha": 0.45,
+        },
+        "Axis": {
+            "major_label_text_color": "#dbe4f0",
+            "axis_label_text_color": "#f3f4f6",
+            "major_tick_line_color": "#8b9bb4",
+            "minor_tick_line_color": "#55637a",
+            "axis_line_color": "#8b9bb4",
+        },
+        "Title": {
+            "text_color": "#f3f4f6",
+        },
+        "Legend": {
+            "label_text_color": "#dbe4f0",
+            "background_fill_color": "#111827",
+            "border_line_color": "#374151",
+        },
+        "ColorBar": {
+            "background_fill_color": "#10141f",
+            "major_label_text_color": "#dbe4f0",
+            "title_text_color": "#f3f4f6",
+        },
+        "BaseColorBar": {
+            "background_fill_color": "#10141f",
+        },
+        "Tabs": {
+            "tabs_location": "above",
+        },
+    }
+}
+
+
+def _apply_dark_theme(doc):
+    if not bokeh_and_dependencies_available:
+        return
+    doc.theme = Theme(json=_DARK_THEME_JSON)
 
 
 def _parse_csv_items(value):
@@ -261,6 +308,10 @@ def _append_dashboard_launch_args(cmd, options):
         cmd.extend(['--tab-core', options.tab_core])
     if getattr(options, 'base_port', None) is not None:
         cmd.extend(['--base-port', str(options.base_port)])
+    if getattr(options, 'idle_shutdown_seconds', None) is not None:
+        cmd.extend(['--idle-shutdown-seconds', str(options.idle_shutdown_seconds)])
+    if not getattr(options, 'highlight_jacobian_structure', _DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE):
+        cmd.append('--disable-jacobian-highlighting')
 
 
 def _add_dashboard_cli_arguments(parser):
@@ -298,6 +349,19 @@ def _add_dashboard_cli_arguments(parser):
         type=int,
         default=_DEFAULT_MULTIWINDOW_BASE_PORT,
         help='Base port for deterministic multiwindow tab URLs. Tab ports are assigned by tab order offset.',
+    )
+    parser.add_argument(
+        '--idle-shutdown-seconds',
+        type=float,
+        default=_CHILD_IDLE_SHUTDOWN_SECONDS,
+        help='Seconds a multiwindow child tab stays alive with zero browser sessions before exiting.',
+    )
+    parser.add_argument(
+        '--disable-jacobian-highlighting',
+        action='store_false',
+        dest='highlight_jacobian_structure',
+        default=_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE,
+        help='Disable zero/dependent row and column highlighting in the Jacobian heatmap tab.',
     )
 
 
@@ -358,6 +422,8 @@ def _realtime_plot_cmd(options, user_args):
             options.tabs,
             options.tab_core,
             options.base_port,
+            options.idle_shutdown_seconds,
+            options.highlight_jacobian_structure,
         )
     else:
         print(
@@ -674,7 +740,8 @@ class _CaseRecorderTracker:
 
 def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_filename,
                                  callback_period, pid_of_calling_script, script,
-                                 meta_file, hist_file, host, port_number):
+                                 meta_file, hist_file, host, port_number,
+                                 idle_shutdown_seconds, highlight_jacobian_structure):
     server = None
     idle_callback = None
     try:
@@ -684,6 +751,7 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
         app_url = f"http://{host}:{port_number}/"
 
         def _make_tab_doc(doc):
+            _apply_dark_theme(doc)
             case_tracker = _CaseRecorderTracker(case_recorder_filename)
             case_tracker.set_source_process_pid(pid_of_calling_script)
             metadata = load_rtplot_metadata(
@@ -711,6 +779,7 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
                     script,
                     metadata=metadata,
                     hist_file=hist_file,
+                    highlight_jacobian_structure=highlight_jacobian_structure,
                 )
 
         server = Server(
@@ -729,7 +798,12 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
         )
         server.start()
         idle_callback = PeriodicCallback(
-            _make_child_session_monitor(server, tab_name, pid_of_calling_script),
+            _make_child_session_monitor(
+                server,
+                tab_name,
+                pid_of_calling_script,
+                idle_shutdown_seconds=idle_shutdown_seconds,
+            ),
             _CHILD_IDLE_CHECK_PERIOD_MS,
         )
         idle_callback.start()
@@ -762,7 +836,8 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
 def _launch_multiwindow_dashboard(case_recorder_filename, callback_period,
                                   pid_of_calling_script, script, meta_file,
                                   hist_file, open_browser, host, selected_tabs,
-                                  core_assignments, base_port):
+                                  core_assignments, base_port, idle_shutdown_seconds,
+                                  highlight_jacobian_structure):
     context = multiprocessing.get_context('spawn')
     startup_queue = context.Queue()
     processes = {}
@@ -783,6 +858,8 @@ def _launch_multiwindow_dashboard(case_recorder_filename, callback_period,
                     hist_file,
                     host,
                     _port_for_dashboard_tab(tab_name, base_port),
+                    idle_shutdown_seconds,
+                    highlight_jacobian_structure,
                 ),
             )
             proc.start()
@@ -848,7 +925,9 @@ def realtime_plot(case_recorder_filename, callback_period,
                   pid_of_calling_script, script, meta_file=None, hist_file=None,
                   open_browser=False, host='127.0.0.1',
                   dashboard_mode=_DASHBOARD_MODE_TABBED, tabs_value=None,
-                  tab_core_value=None, base_port=_DEFAULT_MULTIWINDOW_BASE_PORT):
+                  tab_core_value=None, base_port=_DEFAULT_MULTIWINDOW_BASE_PORT,
+                  idle_shutdown_seconds=_CHILD_IDLE_SHUTDOWN_SECONDS,
+                  highlight_jacobian_structure=_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE):
     """
     Visualize the objectives, desvars, and constraints during an optimization or analysis process.
 
@@ -891,11 +970,14 @@ def realtime_plot(case_recorder_filename, callback_period,
             selected_tabs,
             core_assignments,
             base_port,
+            idle_shutdown_seconds,
+            highlight_jacobian_structure,
         )
         return
 
     def _make_realtime_plot_doc(doc):
         print(f"Creating realtime plot document for {case_recorder_filename}")
+        _apply_dark_theme(doc)
         metadata = load_rtplot_metadata(meta_file=meta_file, case_recorder_filename=case_recorder_filename)
         if is_optimizer:
             local_case_tracker = _CaseRecorderTracker(case_recorder_filename)
@@ -908,6 +990,7 @@ def realtime_plot(case_recorder_filename, callback_period,
                 script=script,
                 metadata=metadata,
                 hist_file=hist_file,
+                highlight_jacobian_structure=highlight_jacobian_structure,
             )
         else:
             local_case_tracker = _CaseRecorderTracker(case_recorder_filename)

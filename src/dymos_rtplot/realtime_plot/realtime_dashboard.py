@@ -36,6 +36,11 @@ _HEAVY_TAB_STRIDE = 5
 _ZERO_JAC_THRESHOLD = 1.0e-16
 _DEFAULT_LINE_COLORS = Category20[20]
 _PHASE_COLORS = Category10[10]
+_DARK_BG = "#0b1220"
+_DARK_PANEL = "#111827"
+_DARK_BORDER = "#334155"
+_DARK_TEXT = "#e5edf7"
+_DARK_MUTED = "#9fb0c7"
 CASE_PLOTTER_TAB = "case-plotter"
 TRAJECTORY_TAB = "trajectory"
 SERIES_TAB = "series"
@@ -69,6 +74,23 @@ def _ensure_figure_legend(fig):
     legend.visible = True
     legend.location = "top_left"
     legend.click_policy = "hide"
+
+
+def _styled_div(text=""):
+    return Div(text=text, styles={"color": _DARK_TEXT})
+
+
+def _style_figure(fig):
+    fig.background_fill_color = _DARK_BG
+    fig.border_fill_color = _DARK_BG
+    fig.outline_line_color = _DARK_BORDER
+    fig.xaxis.major_label_text_color = _DARK_TEXT
+    fig.yaxis.major_label_text_color = _DARK_TEXT
+    fig.xaxis.axis_label_text_color = _DARK_TEXT
+    fig.yaxis.axis_label_text_color = _DARK_TEXT
+    fig.title.text_color = _DARK_TEXT
+    fig.xgrid.grid_line_color = "#223046"
+    fig.ygrid.grid_line_color = "#223046"
 
 
 def _flatten(arr):
@@ -122,16 +144,31 @@ def _constraint_violation(values, lower=None, upper=None, equals=None):
 def _collapse_repeated_samples(xvals, yvals, violation=None, atol=1.0e-10, rtol=1.0e-10):
     x = np.asarray(xvals, dtype=float)
     y = np.asarray(yvals, dtype=float)
-    if x.size <= 1:
-        if violation is None:
-            return x, y, violation
-        return x, y, np.asarray(violation, dtype=bool)
+    if y.ndim > 1:
+        y = np.asarray(y)
 
-    keep = np.ones(x.shape[0], dtype=bool)
     if violation is None:
         violation_arr = None
     else:
-        violation_arr = np.asarray(violation, dtype=bool)
+        violation_arr = np.asarray(violation, dtype=bool).reshape(-1)
+
+    common_len = x.shape[0]
+    if y.shape[0] != common_len:
+        common_len = min(common_len, y.shape[0])
+    if violation_arr is not None and violation_arr.shape[0] != common_len:
+        common_len = min(common_len, violation_arr.shape[0])
+
+    x = x[:common_len]
+    y = y[:common_len]
+    if violation_arr is not None:
+        violation_arr = violation_arr[:common_len]
+
+    if x.size <= 1:
+        if violation_arr is None:
+            return x, y, None
+        return x, y, violation_arr
+
+    keep = np.ones(x.shape[0], dtype=bool)
 
     for idx in range(1, x.shape[0]):
         if x[idx] != x[idx - 1]:
@@ -192,6 +229,21 @@ def _format_suspicious_labels(labels, limit=6):
     return ", ".join(shown)
 
 
+def _normalize_trace_arrays(xvals, yvals, violation=None):
+    x = np.asarray(xvals, dtype=float).reshape(-1)
+    y = np.asarray(yvals, dtype=float).reshape(-1)
+    common_len = min(len(x), len(y))
+    violation_arr = None
+    if violation is not None:
+        violation_arr = np.asarray(violation, dtype=bool).reshape(-1)
+        common_len = min(common_len, len(violation_arr))
+    x = x[:common_len]
+    y = y[:common_len]
+    if violation_arr is None:
+        return x, y, np.zeros(common_len, dtype=bool)
+    return x, y, violation_arr[:common_len]
+
+
 class _TrajectoryTab:
     _CATEGORY_LABELS = {
         "controls": "Controls",
@@ -208,8 +260,8 @@ class _TrajectoryTab:
         self._phase_paths = {}
         self._phase_meta = {}
         self._last_order = None
-        self._status = Div(text="Waiting for trajectory data...")
-        self._warning = Div(text="")
+        self._status = _styled_div("Waiting for trajectory data...")
+        self._warning = _styled_div("")
         self._traj_select = Select(title="Trajectory", options=[], value=None)
         self._order_selects = []
         self._plot_sources = {}
@@ -218,7 +270,7 @@ class _TrajectoryTab:
         self._plot_figures = {}
         self._plot_node_renderers = {}
         self._plot_violation_renderers = {}
-        self._plots_column = column(Div(text="Waiting for trajectory plots..."), sizing_mode="stretch_width")
+        self._plots_column = column(_styled_div("Waiting for trajectory plots..."), sizing_mode="stretch_width")
         self._plots_scroll = ScrollBox(child=self._plots_column, height_policy="max")
         self._display_check = CheckboxGroup(
             labels=["Show node markers", "Show violation markers"],
@@ -310,6 +362,7 @@ class _TrajectoryTab:
             y_axis_label=variable,
             output_backend="webgl",
         )
+        _style_figure(fig)
         line_renderer = fig.multi_line(xs="xs", ys="ys", source=source, line_width=3, line_color="segment_color")
         node_renderer = fig.scatter("x", "y", source=node_source, size=6, color="node_color", alpha=0.95, line_color="black")
         viol_renderer = fig.scatter("x", "y", source=viol_source, size=8, color="red")
@@ -340,7 +393,7 @@ class _TrajectoryTab:
             variables = self._category_variables(traj_meta, category)
             if not variables:
                 continue
-            children.append(Div(text=f"<b>{self._CATEGORY_LABELS[category]}</b>"))
+            children.append(_styled_div(f"<b>{self._CATEGORY_LABELS[category]}</b>"))
             figures = []
             for variable in variables:
                 key = self._plot_key(category, variable)
@@ -403,6 +456,7 @@ class _TrajectoryTab:
                         banner_parts.append(warning)
                     if xvals is None:
                         continue
+                    xvals, yvals, violation_mask = _normalize_trace_arrays(xvals, yvals, violation_mask)
 
                     phase_name = phase_meta["name"]
                     traces_x.append(xvals.tolist())
@@ -731,7 +785,7 @@ class _SeriesTab:
         self._broker = broker
         self._updating_widgets = False
         self._source = ColumnDataSource(data=dict(iteration=[]))
-        self._warning = Div(text="")
+        self._warning = _styled_div("")
         self._group_select = Select(
             title="Group",
             options=list(self._GROUP_LABEL_TO_KEY.keys()),
@@ -745,6 +799,7 @@ class _SeriesTab:
             y_axis_label="Value",
             output_backend="webgl",
         )
+        _style_figure(self._figure)
         placeholder = ColumnDataSource(data=dict(x=[], y=[]))
         self._figure.line("x", "y", source=placeholder, visible=False)
         self._renderers = {}
@@ -867,6 +922,7 @@ class _JacobianEntriesTab:
             y_axis_label="Derivative",
             output_backend="webgl",
         )
+        _style_figure(self._figure)
         placeholder = ColumnDataSource(data=dict(x=[], y=[]))
         self._figure.line("x", "y", source=placeholder, visible=False)
         self._block_select.on_change("value", self._block_changed)
@@ -1050,10 +1106,11 @@ class _JacobianEntriesTab:
 
 
 class _JacobianHeatmapTab:
-    def __init__(self, broker):
+    def __init__(self, broker, highlight_structure=True):
         self._broker = broker
-        self._warning = Div(text="")
-        self._stats = Div(text="Waiting for derivatives...")
+        self._highlight_structure = highlight_structure
+        self._warning = _styled_div("")
+        self._stats = _styled_div("Waiting for derivatives...")
         self._source = ColumnDataSource(data=dict(x=[], y=[], value=[], label=[]))
         self._mapper = LinearColorMapper(palette=RdBu11[::-1], low=-1.0, high=1.0)
         self._figure = figure(
@@ -1064,6 +1121,7 @@ class _JacobianHeatmapTab:
             output_backend="webgl",
             tooltips=[("entry", "@label"), ("sym-log", "@value")],
         )
+        _style_figure(self._figure)
         self._row_highlight_source = ColumnDataSource(data=dict(left=[], right=[], bottom=[], top=[], color=[], kind=[]))
         self._col_highlight_source = ColumnDataSource(data=dict(left=[], right=[], bottom=[], top=[], color=[], kind=[]))
         self._figure.rect(x="x", y="y", width=1, height=1, source=self._source, fill_color={"field": "value", "transform": self._mapper}, line_color=None)
@@ -1218,12 +1276,16 @@ class _JacobianHeatmapTab:
             col_top.append(float(nrows))
             col_color.append("#17becf")
             col_kind.append("dependent-col")
-        self._row_highlight_source.data = dict(
-            left=row_left, right=row_right, bottom=row_bottom, top=row_top, color=row_color, kind=row_kind
-        )
-        self._col_highlight_source.data = dict(
-            left=col_left, right=col_right, bottom=col_bottom, top=col_top, color=col_color, kind=col_kind
-        )
+        if self._highlight_structure:
+            self._row_highlight_source.data = dict(
+                left=row_left, right=row_right, bottom=row_bottom, top=row_top, color=row_color, kind=row_kind
+            )
+            self._col_highlight_source.data = dict(
+                left=col_left, right=col_right, bottom=col_bottom, top=col_top, color=col_color, kind=col_kind
+            )
+        else:
+            self._row_highlight_source.data = dict(left=[], right=[], bottom=[], top=[], color=[], kind=[])
+            self._col_highlight_source.data = dict(left=[], right=[], bottom=[], top=[], color=[], kind=[])
         if prev_dense is None:
             delta_norm = float("nan")
             max_delta = float("nan")
@@ -1247,11 +1309,14 @@ class _JacobianHeatmapTab:
             warning_parts.append(f"Dependent rows: {_format_suspicious_labels(dep_row_labels)}")
         if dep_col_labels:
             warning_parts.append(f"Dependent columns: {_format_suspicious_labels(dep_col_labels)}")
+        if not self._highlight_structure:
+            warning_parts.append("Jacobian structure highlighting is disabled.")
         self._warning.text = " ".join(warning_parts)
 
 
 class _RealTimeDymosDashboard:
-    def __init__(self, case_tracker, callback_period, doc, pid_of_calling_script, script, metadata=None, hist_file=None):
+    def __init__(self, case_tracker, callback_period, doc, pid_of_calling_script, script,
+                 metadata=None, hist_file=None, highlight_jacobian_structure=True):
         self._broker = LiveDataBroker(case_tracker, metadata=metadata, hist_file=hist_file)
         self._doc = doc
         self._pid = pid_of_calling_script
@@ -1268,6 +1333,7 @@ class _RealTimeDymosDashboard:
                 pid_of_calling_script,
                 script,
                 broker=self._broker,
+                highlight_jacobian_structure=highlight_jacobian_structure,
             )
             self._tab_objects[tab_name] = tab_obj
             self._tab_panels.append(panel)
@@ -1319,7 +1385,8 @@ class _RealTimeDymosDashboard:
             return
 
 
-def _build_dashboard_tab(tab_name, case_tracker, callback_period, doc, pid_of_calling_script, script, broker=None):
+def _build_dashboard_tab(tab_name, case_tracker, callback_period, doc, pid_of_calling_script,
+                         script, broker=None, highlight_jacobian_structure=True):
     if tab_name == CASE_PLOTTER_TAB:
         plot = _RealTimeOptimizerPlot(
             case_tracker,
@@ -1341,7 +1408,7 @@ def _build_dashboard_tab(tab_name, case_tracker, callback_period, doc, pid_of_ca
     elif tab_name == JACOBIAN_ENTRIES_TAB:
         tab = _JacobianEntriesTab(broker)
     elif tab_name == JACOBIAN_HEATMAP_TAB:
-        tab = _JacobianHeatmapTab(broker)
+        tab = _JacobianHeatmapTab(broker, highlight_structure=highlight_jacobian_structure)
     else:
         raise KeyError(f"Unknown dashboard tab: {tab_name}")
 
@@ -1349,7 +1416,8 @@ def _build_dashboard_tab(tab_name, case_tracker, callback_period, doc, pid_of_ca
 
 
 class _StandaloneDashboardTabApp:
-    def __init__(self, tab_name, case_tracker, callback_period, doc, pid_of_calling_script, script, metadata=None, hist_file=None):
+    def __init__(self, tab_name, case_tracker, callback_period, doc, pid_of_calling_script,
+                 script, metadata=None, hist_file=None, highlight_jacobian_structure=True):
         self._tab_name = tab_name
         self._broker = LiveDataBroker(case_tracker, metadata=metadata, hist_file=hist_file)
         self._doc = doc
@@ -1361,6 +1429,7 @@ class _StandaloneDashboardTabApp:
             pid_of_calling_script,
             script,
             broker=self._broker,
+            highlight_jacobian_structure=highlight_jacobian_structure,
         )
         self._doc.add_root(panel.child)
         self._doc.add_periodic_callback(self._update, callback_period)

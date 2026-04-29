@@ -238,6 +238,9 @@ class MultiWindowParsingTests(unittest.TestCase):
                 "case-plotter=0",
                 "--base-port",
                 "58000",
+                "--idle-shutdown-seconds",
+                "45",
+                "--disable-jacobian-highlighting",
                 "example.py",
             ]
         )
@@ -245,6 +248,8 @@ class MultiWindowParsingTests(unittest.TestCase):
         self.assertEqual(args.tabs, "case-plotter,trajectory")
         self.assertEqual(args.tab_core, "case-plotter=0")
         self.assertEqual(args.base_port, 58000)
+        self.assertEqual(args.idle_shutdown_seconds, 45.0)
+        self.assertFalse(args.highlight_jacobian_structure)
         self.assertEqual(args.file, "example.py")
 
     def test_default_tab_order_uses_case_plotter(self):
@@ -608,6 +613,28 @@ class MultiWindowParsingTests(unittest.TestCase):
         self.assertEqual(list(yvals), [10.0, 20.0, 21.0, 30.0])
         self.assertEqual(list(violation), [False, False, True, False])
 
+    def test_collapse_repeated_samples_trims_mismatched_violation_length(self):
+        xvals, yvals, violation = realtime_dashboard._collapse_repeated_samples(
+            [0.0, 1.0, 1.0, 2.0],
+            [10.0, 20.0, 20.0, 30.0],
+            [False, True, False],
+        )
+
+        self.assertEqual(list(xvals), [0.0, 1.0])
+        self.assertEqual(list(yvals), [10.0, 20.0])
+        self.assertEqual(list(violation), [False, True])
+
+    def test_normalize_trace_arrays_trims_to_common_length(self):
+        xvals, yvals, violation = realtime_dashboard._normalize_trace_arrays(
+            [0.0, 1.0, 2.0, 3.0],
+            [10.0, 20.0, 30.0],
+            [False, True],
+        )
+
+        self.assertEqual(list(xvals), [0.0, 1.0])
+        self.assertEqual(list(yvals), [10.0, 20.0])
+        self.assertEqual(list(violation), [False, True])
+
     def test_matrix_rank_and_condition_reports_infinite_for_singular_matrix(self):
         rank, cond = realtime_dashboard._matrix_rank_and_condition([[1.0, 2.0], [2.0, 4.0]])
         self.assertEqual(rank, 1)
@@ -641,6 +668,21 @@ class MultiWindowParsingTests(unittest.TestCase):
         self.assertTrue(tab._row_highlight_source.data["kind"])
         self.assertTrue(tab._col_highlight_source.data["kind"])
 
+    def test_jacobian_heatmap_can_disable_highlighting(self):
+        broker = _FakeBroker()
+        snapshot = _FakeSnapshot()
+        snapshot.derivatives = {
+            ("of", "x"): np.array([[1.0, 2.0], [2.0, 4.0], [0.0, 0.0]]),
+        }
+        broker.snapshots = [snapshot]
+        tab = realtime_dashboard._JacobianHeatmapTab(broker, highlight_structure=False)
+
+        tab.refresh(force=True)
+
+        self.assertEqual(tab._row_highlight_source.data["kind"], [])
+        self.assertEqual(tab._col_highlight_source.data["kind"], [])
+        self.assertIn("highlighting is disabled", tab._warning.text)
+
     def test_launch_multiwindow_dashboard_starts_selected_tabs_and_opens_browser(self):
         messages = [
             {"status": "started", "tab": "case-plotter", "url": "http://127.0.0.1:5001/"},
@@ -665,6 +707,8 @@ class MultiWindowParsingTests(unittest.TestCase):
                 selected_tabs=["case-plotter", "trajectory"],
                 core_assignments={"trajectory": 2},
                 base_port=58000,
+                idle_shutdown_seconds=22.5,
+                highlight_jacobian_structure=False,
             )
 
         self.assertEqual(len(fake_context.processes), 2)
@@ -674,8 +718,16 @@ class MultiWindowParsingTests(unittest.TestCase):
             ["case-plotter", "trajectory"],
         )
         self.assertEqual(
-            [proc.args[-1] for proc in fake_context.processes],
+            [proc.args[-3] for proc in fake_context.processes],
             [58000, 58001],
+        )
+        self.assertEqual(
+            [proc.args[-2] for proc in fake_context.processes],
+            [22.5, 22.5],
+        )
+        self.assertEqual(
+            [proc.args[-1] for proc in fake_context.processes],
+            [False, False],
         )
         open_tab.assert_any_call("http://127.0.0.1:5001/")
         open_tab.assert_any_call("http://127.0.0.1:5002/")
@@ -700,6 +752,8 @@ class MultiWindowParsingTests(unittest.TestCase):
                     selected_tabs=["case-plotter"],
                     core_assignments={},
                     base_port=58000,
+                    idle_shutdown_seconds=15.0,
+                    highlight_jacobian_structure=True,
                 )
 
     def test_live_data_broker_retries_transient_unreadable_case(self):
