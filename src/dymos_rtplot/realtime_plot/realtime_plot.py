@@ -65,6 +65,8 @@ _DASHBOARD_MODE_MULTIWINDOW = 'multiwindow'
 _DASHBOARD_MODE_CHOICES = (_DASHBOARD_MODE_TABBED, _DASHBOARD_MODE_MULTIWINDOW)
 _MULTIWINDOW_STARTUP_TIMEOUT = 30.0
 _DEFAULT_MULTIWINDOW_BASE_PORT = 57003
+_CHILD_IDLE_SHUTDOWN_SECONDS = 15.0
+_CHILD_IDLE_CHECK_PERIOD_MS = 1000
 
 
 def _parse_csv_items(value):
@@ -189,6 +191,61 @@ def _set_process_cpu_affinity(core):
         os.sched_setaffinity(0, {core})
         return
     print(f"CPU affinity is not supported on this platform; ignoring requested core {core}.")
+
+
+def _source_process_running(pid_of_calling_script):
+    if pid_of_calling_script is None:
+        return False
+    try:
+        from openmdao.utils.shell_proc import _is_process_running
+        return _is_process_running(pid_of_calling_script)
+    except Exception:
+        return False
+
+
+def _count_active_server_connections(server):
+    active_connections = 0
+    for session in server.get_sessions("/"):
+        connection_count = getattr(session, "connection_count", 0)
+        destroyed = getattr(session, "destroyed", False)
+        if connection_count > 0 and not destroyed:
+            active_connections += connection_count
+    return active_connections
+
+
+def _make_child_session_monitor(server, tab_name, pid_of_calling_script,
+                                idle_shutdown_seconds=_CHILD_IDLE_SHUTDOWN_SECONDS,
+                                now_fn=time.time):
+    idle_since = None
+
+    def _check():
+        nonlocal idle_since
+
+        active_connections = _count_active_server_connections(server)
+        if active_connections > 0:
+            idle_since = None
+            return
+
+        now = now_fn()
+        if idle_since is None:
+            idle_since = now
+            return
+
+        source_alive = True
+        if pid_of_calling_script is not None:
+            source_alive = _source_process_running(pid_of_calling_script)
+
+        if not source_alive or (now - idle_since) >= idle_shutdown_seconds:
+            if pid_of_calling_script is not None and not source_alive:
+                reason = "source process ended and no active browser sessions remain"
+            else:
+                reason = (
+                    f"no active browser sessions for {int(idle_shutdown_seconds)} seconds"
+                )
+            print(f"Stopping {DASHBOARD_TAB_TITLES[tab_name]} server: {reason}")
+            server.io_loop.stop()
+
+    return _check
 
 
 def _append_dashboard_launch_args(cmd, options):
@@ -619,6 +676,7 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
                                  callback_period, pid_of_calling_script, script,
                                  meta_file, hist_file, host, port_number):
     server = None
+    idle_callback = None
     try:
         if core is not None:
             _set_process_cpu_affinity(core)
@@ -670,6 +728,11 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
             ],
         )
         server.start()
+        idle_callback = PeriodicCallback(
+            _make_child_session_monitor(server, tab_name, pid_of_calling_script),
+            _CHILD_IDLE_CHECK_PERIOD_MS,
+        )
+        idle_callback.start()
         startup_queue.put({
             "status": "started",
             "tab": tab_name,
@@ -690,6 +753,8 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
         })
         print(f"Error starting {DASHBOARD_TAB_TITLES.get(tab_name, tab_name)} server: {err}")
     finally:
+        if idle_callback is not None:
+            idle_callback.stop()
         if server is not None:
             server.stop()
 

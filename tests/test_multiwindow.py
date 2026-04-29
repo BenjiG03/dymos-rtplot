@@ -128,6 +128,29 @@ class _FakeKernel32:
         return 1
 
 
+class _FakeSession:
+    def __init__(self, connection_count=0, destroyed=False):
+        self.connection_count = connection_count
+        self.destroyed = destroyed
+
+
+class _FakeIOLoop:
+    def __init__(self):
+        self.stop_called = False
+
+    def stop(self):
+        self.stop_called = True
+
+
+class _FakeServer:
+    def __init__(self, sessions=None):
+        self.sessions = list(sessions or [])
+        self.io_loop = _FakeIOLoop()
+
+    def get_sessions(self, path):
+        return list(self.sessions)
+
+
 class MultiWindowParsingTests(unittest.TestCase):
     def test_main_routes_direct_entrypoint_args_to_rtplot(self):
         with mock.patch("dymos_rtplot.rtplot._rtplot_cmd") as rtplot_cmd, \
@@ -263,6 +286,79 @@ class MultiWindowParsingTests(unittest.TestCase):
 
         self.assertTrue(fake_kernel32.get_current_process_called)
         self.assertEqual(fake_kernel32.affinity_calls, [(1234, 8)])
+
+    def test_count_active_server_connections_ignores_destroyed_or_disconnected_sessions(self):
+        server = _FakeServer(
+            sessions=[
+                _FakeSession(connection_count=2, destroyed=False),
+                _FakeSession(connection_count=1, destroyed=True),
+                _FakeSession(connection_count=0, destroyed=False),
+            ]
+        )
+        self.assertEqual(realtime_plot._count_active_server_connections(server), 2)
+
+    def test_child_session_monitor_resets_idle_timer_when_connections_return(self):
+        server = _FakeServer(sessions=[_FakeSession(connection_count=0)])
+        current_time = {"value": 10.0}
+        monitor = realtime_plot._make_child_session_monitor(
+            server,
+            "trajectory",
+            pid_of_calling_script=None,
+            idle_shutdown_seconds=15.0,
+            now_fn=lambda: current_time["value"],
+        )
+
+        monitor()
+        current_time["value"] = 20.0
+        server.sessions = [_FakeSession(connection_count=1)]
+        monitor()
+        server.sessions = [_FakeSession(connection_count=0)]
+        monitor()
+        current_time["value"] = 30.0
+        monitor()
+
+        self.assertFalse(server.io_loop.stop_called)
+
+    def test_child_session_monitor_stops_after_idle_timeout(self):
+        server = _FakeServer(sessions=[_FakeSession(connection_count=0)])
+        current_time = {"value": 100.0}
+        monitor = realtime_plot._make_child_session_monitor(
+            server,
+            "trajectory",
+            pid_of_calling_script=None,
+            idle_shutdown_seconds=15.0,
+            now_fn=lambda: current_time["value"],
+        )
+
+        monitor()
+        current_time["value"] = 114.0
+        monitor()
+        self.assertFalse(server.io_loop.stop_called)
+
+        current_time["value"] = 115.0
+        monitor()
+        self.assertTrue(server.io_loop.stop_called)
+
+    def test_child_session_monitor_stops_when_source_process_ends_with_no_sessions(self):
+        server = _FakeServer(sessions=[_FakeSession(connection_count=0)])
+        current_time = {"value": 50.0}
+        monitor = realtime_plot._make_child_session_monitor(
+            server,
+            "series",
+            pid_of_calling_script=123,
+            idle_shutdown_seconds=15.0,
+            now_fn=lambda: current_time["value"],
+        )
+
+        with mock.patch(
+            "dymos_rtplot.realtime_plot.realtime_plot._source_process_running",
+            return_value=False,
+        ):
+            monitor()
+            current_time["value"] = 51.0
+            monitor()
+
+        self.assertTrue(server.io_loop.stop_called)
 
     def test_build_dashboard_tab_uses_case_plotter_title(self):
         fake_plot = mock.Mock()
