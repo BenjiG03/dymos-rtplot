@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 import queue as std_queue
+import tempfile
+from pathlib import Path
 
 import numpy as np
 from bokeh.models import Div
@@ -241,6 +243,7 @@ class MultiWindowParsingTests(unittest.TestCase):
                 "--idle-shutdown-seconds",
                 "45",
                 "--disable-jacobian-highlighting",
+                "--light-mode",
                 "example.py",
             ]
         )
@@ -250,7 +253,17 @@ class MultiWindowParsingTests(unittest.TestCase):
         self.assertEqual(args.base_port, 58000)
         self.assertEqual(args.idle_shutdown_seconds, 45.0)
         self.assertFalse(args.highlight_jacobian_structure)
+        self.assertFalse(args.dark_mode)
         self.assertEqual(args.file, "example.py")
+
+    def test_main_routes_clean_subcommand_without_entrypoint_rewrite(self):
+        with mock.patch(
+            "dymos_rtplot.rtplot.clean_rtplot_artifacts",
+            return_value={"root": ".", "dirs": [], "files": []},
+        ) as clean_fn:
+            rtplot.main(["clean", ".", "--dry-run"])
+
+        clean_fn.assert_called_once_with(".", dry_run=True)
 
     def test_default_tab_order_uses_case_plotter(self):
         self.assertEqual(
@@ -472,6 +485,7 @@ class MultiWindowParsingTests(unittest.TestCase):
                                 "promoted_path": "traj.phase0",
                                 "states": {"x": {}},
                                 "controls": {"u": {}},
+                                "defect_outputs": {"collocation:x": {"path": "traj.phase0.collocation_constraint.defects:x"}},
                                 "timeseries_outputs": {"y": {"category": "ode"}},
                             }
                         ],
@@ -485,6 +499,68 @@ class MultiWindowParsingTests(unittest.TestCase):
         original_children = tab._plots_column.children
         tab._rebuild_plots()
         self.assertIs(tab._plots_column.children, original_children)
+        self.assertIn("defects", tab._selected_order())
+
+    def test_trajectory_tab_includes_defect_outputs_category(self):
+        broker = _FakeBroker(
+            metadata={
+                "trajectories": [
+                    {
+                        "name": "traj",
+                        "phases": [
+                            {
+                                "name": "phase0",
+                                "promoted_path": "traj.phase0",
+                                "states": {"x": {}},
+                                "controls": {"u": {}},
+                                "defect_outputs": {
+                                    "collocation:x": {
+                                        "path": "traj.phase0.collocation_constraint.defects:x",
+                                        "node_ptau": [-0.5, 0.5],
+                                    }
+                                },
+                                "timeseries_outputs": {},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        tab = realtime_dashboard._TrajectoryTab(broker)
+        tab._ensure_initialized()
+        traj_meta = tab._traj_meta()
+        self.assertIn("collocation:x", tab._category_variables(traj_meta, "defects"))
+
+    def test_trajectory_tab_grid_uses_dark_container_styles_in_dark_mode(self):
+        realtime_dashboard._set_dark_mode_enabled(True)
+        try:
+            broker = _FakeBroker(
+                metadata={
+                    "trajectories": [
+                        {
+                            "name": "traj",
+                            "phases": [
+                                {
+                                    "name": "phase0",
+                                    "promoted_path": "traj.phase0",
+                                    "states": {"x": {}},
+                                    "controls": {},
+                                    "defect_outputs": {},
+                                    "timeseries_outputs": {},
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+            tab = realtime_dashboard._TrajectoryTab(broker)
+            tab._ensure_initialized()
+            tab._rebuild_plots()
+
+            grid = tab._plots_column.children[1]
+            self.assertEqual(grid.styles.get("background-color"), "#0b1220")
+        finally:
+            realtime_dashboard._set_dark_mode_enabled(True)
 
     def test_series_tab_refresh_keeps_visible_legend(self):
         broker = _FakeBroker()
@@ -709,6 +785,7 @@ class MultiWindowParsingTests(unittest.TestCase):
                 base_port=58000,
                 idle_shutdown_seconds=22.5,
                 highlight_jacobian_structure=False,
+                dark_mode=False,
             )
 
         self.assertEqual(len(fake_context.processes), 2)
@@ -718,12 +795,16 @@ class MultiWindowParsingTests(unittest.TestCase):
             ["case-plotter", "trajectory"],
         )
         self.assertEqual(
-            [proc.args[-3] for proc in fake_context.processes],
+            [proc.args[-4] for proc in fake_context.processes],
             [58000, 58001],
         )
         self.assertEqual(
-            [proc.args[-2] for proc in fake_context.processes],
+            [proc.args[-3] for proc in fake_context.processes],
             [22.5, 22.5],
+        )
+        self.assertEqual(
+            [proc.args[-2] for proc in fake_context.processes],
+            [False, False],
         )
         self.assertEqual(
             [proc.args[-1] for proc in fake_context.processes],
@@ -754,6 +835,7 @@ class MultiWindowParsingTests(unittest.TestCase):
                     base_port=58000,
                     idle_shutdown_seconds=15.0,
                     highlight_jacobian_structure=True,
+                    dark_mode=True,
                 )
 
     def test_live_data_broker_retries_transient_unreadable_case(self):
@@ -786,6 +868,23 @@ class MultiWindowParsingTests(unittest.TestCase):
 
         dashboard._tab_objects[realtime_dashboard.CASE_PLOTTER_TAB]._update_wrapped_in_try.assert_called_once()
         dashboard._broker.poll.assert_called_once()
+
+    def test_clean_rtplot_artifacts_dry_run_finds_expected_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "a.sqlite").write_text("x", encoding="utf-8")
+            (root / "a.sqlite.rtplot_meta.json").write_text("{}", encoding="utf-8")
+            (root / "a.hst").write_text("x", encoding="utf-8")
+            out_dir = root / "case_out"
+            out_dir.mkdir()
+            (out_dir / "dymos_solution.db").write_text("x", encoding="utf-8")
+
+            result = realtime_plot.clean_rtplot_artifacts(root, dry_run=True)
+
+            self.assertEqual(len(result["files"]), 3)
+            self.assertEqual(len(result["dirs"]), 1)
+            self.assertTrue((root / "a.sqlite").exists())
+            self.assertTrue(out_dir.exists())
 
 
 if __name__ == "__main__":

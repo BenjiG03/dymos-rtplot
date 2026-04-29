@@ -7,6 +7,7 @@ from ctypes import wintypes
 import multiprocessing
 import os
 import queue
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -32,13 +33,17 @@ from dymos_rtplot.realtime_plot.realtime_dashboard import (
     TRAJECTORY_TAB,
     _RealTimeDymosDashboard,
     _StandaloneDashboardTabApp,
+    _set_dark_mode_enabled as _set_dashboard_dark_mode_enabled,
     get_dashboard_tab_names,
 )
 from dymos_rtplot.realtime_plot.realtime_metadata import (
     load_rtplot_metadata,
     write_rtplot_metadata,
 )
-from dymos_rtplot.realtime_plot.realtime_optimizer_plot import _RealTimeOptimizerPlot
+from dymos_rtplot.realtime_plot.realtime_optimizer_plot import (
+    _RealTimeOptimizerPlot,
+    _set_dark_mode_enabled as _set_optimizer_dark_mode_enabled,
+)
 
 try:
     from bokeh.server.server import Server
@@ -69,6 +74,7 @@ _DEFAULT_MULTIWINDOW_BASE_PORT = 57003
 _CHILD_IDLE_SHUTDOWN_SECONDS = 15.0
 _CHILD_IDLE_CHECK_PERIOD_MS = 1000
 _DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE = True
+_DEFAULT_DARK_MODE = True
 _DARK_THEME_JSON = {
     "attrs": {
         "figure": {
@@ -110,10 +116,52 @@ _DARK_THEME_JSON = {
 }
 
 
-def _apply_dark_theme(doc):
-    if not bokeh_and_dependencies_available:
+def _apply_dark_theme(doc, enabled=True):
+    if not bokeh_and_dependencies_available or not enabled:
         return
     doc.theme = Theme(json=_DARK_THEME_JSON)
+
+
+def _readonly_sqlite_connection(path):
+    db_uri = Path(path).resolve().as_uri().replace("file:///", "file:///") + "?mode=ro"
+    return sqlite3.connect(db_uri, uri=True)
+
+
+def clean_rtplot_artifacts(root_dir=".", dry_run=False):
+    root = Path(root_dir).resolve()
+    file_patterns = (
+        "*.sqlite",
+        "*.sqlite.rtplot_meta.json",
+        "*.hst",
+    )
+    dir_patterns = (
+        "*_out",
+    )
+    removed_files = []
+    removed_dirs = []
+
+    for pattern in file_patterns:
+        for path in root.rglob(pattern):
+            if not path.is_file():
+                continue
+            removed_files.append(path)
+            if not dry_run:
+                path.unlink(missing_ok=True)
+
+    for pattern in dir_patterns:
+        for path in root.rglob(pattern):
+            if not path.is_dir():
+                continue
+            removed_dirs.append(path)
+            if not dry_run:
+                shutil.rmtree(path, ignore_errors=True)
+
+    return {
+        "root": str(root),
+        "dry_run": dry_run,
+        "files": [str(path) for path in sorted(set(removed_files))],
+        "dirs": [str(path) for path in sorted(set(removed_dirs))],
+    }
 
 
 def _parse_csv_items(value):
@@ -287,7 +335,7 @@ def _make_child_session_monitor(server, tab_name, pid_of_calling_script,
                 reason = "source process ended and no active browser sessions remain"
             else:
                 reason = (
-                    f"no active browser sessions for {int(idle_shutdown_seconds)} seconds"
+                    f"no active browser sessions for {idle_shutdown_seconds:g} seconds"
                 )
             print(f"Stopping {DASHBOARD_TAB_TITLES[tab_name]} server: {reason}")
             server.io_loop.stop()
@@ -312,56 +360,71 @@ def _append_dashboard_launch_args(cmd, options):
         cmd.extend(['--idle-shutdown-seconds', str(options.idle_shutdown_seconds)])
     if not getattr(options, 'highlight_jacobian_structure', _DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE):
         cmd.append('--disable-jacobian-highlighting')
+    if not getattr(options, 'dark_mode', _DEFAULT_DARK_MODE):
+        cmd.append('--light-mode')
 
 
 def _add_dashboard_cli_arguments(parser):
     parser.add_argument(
-        '--open-browser',
+        '-b', '--open-browser',
         action='store_true',
         help='Attempt to open the dashboard URL in the system browser.',
     )
     parser.add_argument(
-        '--host',
+        '-H', '--host',
         type=str,
         default='127.0.0.1',
         help='Host interface to bind the Bokeh server to. Defaults to 127.0.0.1.',
     )
     parser.add_argument(
-        '--dashboard-mode',
+        '-m', '--dashboard-mode',
         choices=_DASHBOARD_MODE_CHOICES,
         default=_DASHBOARD_MODE_TABBED,
         help='Launch the optimizer dashboard in one tabbed window or as separate per-tab windows.',
     )
     parser.add_argument(
-        '--tabs',
+        '-t', '--tabs',
         type=str,
         default=None,
         help='Comma-separated dashboard tabs to launch in multiwindow mode.',
     )
     parser.add_argument(
-        '--tab-core',
+        '-c', '--tab-core',
         type=str,
         default=None,
         help='Comma-separated CPU affinity assignments in the form tab=core for multiwindow mode.',
     )
     parser.add_argument(
-        '--base-port',
+        '-p', '--base-port',
         type=int,
         default=_DEFAULT_MULTIWINDOW_BASE_PORT,
         help='Base port for deterministic multiwindow tab URLs. Tab ports are assigned by tab order offset.',
     )
     parser.add_argument(
-        '--idle-shutdown-seconds',
+        '-s', '--idle-shutdown-seconds',
         type=float,
         default=_CHILD_IDLE_SHUTDOWN_SECONDS,
         help='Seconds a multiwindow child tab stays alive with zero browser sessions before exiting.',
     )
     parser.add_argument(
-        '--disable-jacobian-highlighting',
+        '-J', '--disable-jacobian-highlighting',
         action='store_false',
         dest='highlight_jacobian_structure',
         default=_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE,
         help='Disable zero/dependent row and column highlighting in the Jacobian heatmap tab.',
+    )
+    parser.add_argument(
+        '-D', '--dark-mode',
+        action='store_true',
+        dest='dark_mode',
+        default=_DEFAULT_DARK_MODE,
+        help='Enable the dark dashboard theme.',
+    )
+    parser.add_argument(
+        '-L', '--light-mode',
+        action='store_false',
+        dest='dark_mode',
+        help='Disable the dark dashboard theme.',
     )
 
 
@@ -424,6 +487,7 @@ def _realtime_plot_cmd(options, user_args):
             options.base_port,
             options.idle_shutdown_seconds,
             options.highlight_jacobian_structure,
+            options.dark_mode,
         )
     else:
         print(
@@ -624,7 +688,7 @@ class _CaseRecorderTracker:
 
     def _get_case_by_counter(self, counter):
         # use SQL to see if a case with this counter exists
-        with sqlite3.connect(self._case_recorder_filename) as con:
+        with _readonly_sqlite_connection(self._case_recorder_filename) as con:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
             cur.execute(
@@ -741,7 +805,8 @@ class _CaseRecorderTracker:
 def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_filename,
                                  callback_period, pid_of_calling_script, script,
                                  meta_file, hist_file, host, port_number,
-                                 idle_shutdown_seconds, highlight_jacobian_structure):
+                                 idle_shutdown_seconds, highlight_jacobian_structure,
+                                 dark_mode):
     server = None
     idle_callback = None
     try:
@@ -751,7 +816,9 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
         app_url = f"http://{host}:{port_number}/"
 
         def _make_tab_doc(doc):
-            _apply_dark_theme(doc)
+            _set_dashboard_dark_mode_enabled(dark_mode)
+            _set_optimizer_dark_mode_enabled(dark_mode)
+            _apply_dark_theme(doc, enabled=dark_mode)
             case_tracker = _CaseRecorderTracker(case_recorder_filename)
             case_tracker.set_source_process_pid(pid_of_calling_script)
             metadata = load_rtplot_metadata(
@@ -837,7 +904,7 @@ def _launch_multiwindow_dashboard(case_recorder_filename, callback_period,
                                   pid_of_calling_script, script, meta_file,
                                   hist_file, open_browser, host, selected_tabs,
                                   core_assignments, base_port, idle_shutdown_seconds,
-                                  highlight_jacobian_structure):
+                                  highlight_jacobian_structure, dark_mode):
     context = multiprocessing.get_context('spawn')
     startup_queue = context.Queue()
     processes = {}
@@ -860,6 +927,7 @@ def _launch_multiwindow_dashboard(case_recorder_filename, callback_period,
                     _port_for_dashboard_tab(tab_name, base_port),
                     idle_shutdown_seconds,
                     highlight_jacobian_structure,
+                    dark_mode,
                 ),
             )
             proc.start()
@@ -927,7 +995,8 @@ def realtime_plot(case_recorder_filename, callback_period,
                   dashboard_mode=_DASHBOARD_MODE_TABBED, tabs_value=None,
                   tab_core_value=None, base_port=_DEFAULT_MULTIWINDOW_BASE_PORT,
                   idle_shutdown_seconds=_CHILD_IDLE_SHUTDOWN_SECONDS,
-                  highlight_jacobian_structure=_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE):
+                  highlight_jacobian_structure=_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE,
+                  dark_mode=_DEFAULT_DARK_MODE):
     """
     Visualize the objectives, desvars, and constraints during an optimization or analysis process.
 
@@ -972,12 +1041,15 @@ def realtime_plot(case_recorder_filename, callback_period,
             base_port,
             idle_shutdown_seconds,
             highlight_jacobian_structure,
+            dark_mode,
         )
         return
 
     def _make_realtime_plot_doc(doc):
         print(f"Creating realtime plot document for {case_recorder_filename}")
-        _apply_dark_theme(doc)
+        _set_dashboard_dark_mode_enabled(dark_mode)
+        _set_optimizer_dark_mode_enabled(dark_mode)
+        _apply_dark_theme(doc, enabled=dark_mode)
         metadata = load_rtplot_metadata(meta_file=meta_file, case_recorder_filename=case_recorder_filename)
         if is_optimizer:
             local_case_tracker = _CaseRecorderTracker(case_recorder_filename)

@@ -41,6 +41,7 @@ _DARK_PANEL = "#111827"
 _DARK_BORDER = "#334155"
 _DARK_TEXT = "#e5edf7"
 _DARK_MUTED = "#9fb0c7"
+_DARK_MODE_ENABLED = True
 CASE_PLOTTER_TAB = "case-plotter"
 TRAJECTORY_TAB = "trajectory"
 SERIES_TAB = "series"
@@ -76,11 +77,35 @@ def _ensure_figure_legend(fig):
     legend.click_policy = "hide"
 
 
+def _set_dark_mode_enabled(enabled):
+    global _DARK_MODE_ENABLED
+    _DARK_MODE_ENABLED = bool(enabled)
+
+
 def _styled_div(text=""):
-    return Div(text=text, styles={"color": _DARK_TEXT})
+    styles = {"color": _DARK_TEXT} if _DARK_MODE_ENABLED else {}
+    return Div(text=text, styles=styles)
+
+
+def _container_styles():
+    if not _DARK_MODE_ENABLED:
+        return {}
+    return {"background-color": _DARK_BG, "color": _DARK_TEXT}
+
+
+def _panel_styles():
+    if not _DARK_MODE_ENABLED:
+        return {}
+    return {
+        "background-color": _DARK_PANEL,
+        "border": f"1px solid {_DARK_BORDER}",
+        "color": _DARK_TEXT,
+    }
 
 
 def _style_figure(fig):
+    if not _DARK_MODE_ENABLED:
+        return
     fig.background_fill_color = _DARK_BG
     fig.border_fill_color = _DARK_BG
     fig.outline_line_color = _DARK_BORDER
@@ -249,6 +274,7 @@ class _TrajectoryTab:
         "controls": "Controls",
         "states": "States",
         "ode": "ODE Values",
+        "defects": "Defect Constraints",
         "state_rates": "State Rates",
         "control_rates": "Control Rates",
     }
@@ -270,8 +296,16 @@ class _TrajectoryTab:
         self._plot_figures = {}
         self._plot_node_renderers = {}
         self._plot_violation_renderers = {}
-        self._plots_column = column(_styled_div("Waiting for trajectory plots..."), sizing_mode="stretch_width")
-        self._plots_scroll = ScrollBox(child=self._plots_column, height_policy="max")
+        self._plots_column = column(
+            _styled_div("Waiting for trajectory plots..."),
+            sizing_mode="stretch_width",
+            styles=_container_styles(),
+        )
+        self._plots_scroll = ScrollBox(
+            child=self._plots_column,
+            height_policy="max",
+            styles=_container_styles(),
+        )
         self._display_check = CheckboxGroup(
             labels=["Show node markers", "Show violation markers"],
             active=[0, 1],
@@ -279,7 +313,7 @@ class _TrajectoryTab:
 
         order_controls = []
         category_options = [(key, label) for key, label in self._CATEGORY_LABELS.items()]
-        default_order = ["controls", "states", "ode", "state_rates", "control_rates"]
+        default_order = ["controls", "states", "ode", "defects", "state_rates", "control_rates"]
         for idx, category in enumerate(default_order, start=1):
             select = Select(title=f"Order {idx}", options=category_options, value=category, width=180)
             select.on_change("value", self._selection_changed)
@@ -288,9 +322,22 @@ class _TrajectoryTab:
 
         self._traj_select.on_change("value", self._selection_changed)
         self._display_check.on_change("active", self._selection_changed)
-        controls = row(self._traj_select, *order_controls, self._display_check, sizing_mode="stretch_width")
+        controls = row(
+            self._traj_select,
+            *order_controls,
+            self._display_check,
+            sizing_mode="stretch_width",
+            styles=_container_styles(),
+        )
         self.panel = TabPanel(
-            child=column(self._status, self._warning, controls, self._plots_scroll, sizing_mode="stretch_both"),
+            child=column(
+                self._status,
+                self._warning,
+                controls,
+                self._plots_scroll,
+                sizing_mode="stretch_both",
+                styles=_container_styles(),
+            ),
             title=DASHBOARD_TAB_TITLES[TRAJECTORY_TAB],
         )
 
@@ -344,6 +391,8 @@ class _TrajectoryTab:
                 for name, meta in phase_meta.get("timeseries_outputs", {}).items():
                     if meta.get("category") == "ode":
                         found.add(name)
+            elif category == "defects":
+                found.update(phase_meta.get("defect_outputs", {}).keys())
         return sorted(found)
 
     def _plot_key(self, category, variable):
@@ -400,15 +449,15 @@ class _TrajectoryTab:
                 if key not in self._plot_figures:
                     self._make_plot(category, variable)
                 figures.append(self._plot_figures[key])
-            children.append(
-                gridplot(
-                    figures,
-                    ncols=3,
-                    sizing_mode="stretch_width",
-                    merge_tools=False,
-                    toolbar_location=None,
-                )
+            grid = gridplot(
+                figures,
+                ncols=3,
+                sizing_mode="stretch_width",
+                merge_tools=False,
+                toolbar_location=None,
             )
+            grid.styles = _container_styles()
+            children.append(grid)
         self._plots_column.children = children
         self._last_order = ordered_categories
 
@@ -495,6 +544,8 @@ class _TrajectoryTab:
             return self._control_trace(case, phase_meta, variable)
         if category == "control_rates":
             return self._control_trace(case, phase_meta, variable, derivative_order=1)
+        if category == "defects":
+            return self._defect_trace(case, phase_meta, variable)
         return self._ode_trace(case, phase_meta, variable)
 
     def _physical_time(self, case, phase_meta):
@@ -637,6 +688,12 @@ class _TrajectoryTab:
             return None, None, np.array([], dtype=bool), None
         return self._timeseries_trace(case, phase_meta, meta["path"], boundary_state=meta)
 
+    def _defect_trace(self, case, phase_meta, variable):
+        meta = phase_meta.get("defect_outputs", {}).get(variable)
+        if not meta:
+            return None, None, np.array([], dtype=bool), None
+        return self._defect_output_trace(case, phase_meta, meta["path"], meta.get("node_ptau"))
+
     def _timeseries_trace(self, case, phase_meta, relative_path, boundary_state=None, warning=None):
         phase_path = phase_meta["promoted_path"]
         path = relative_path if relative_path.startswith(phase_path) else f"{phase_path}.{relative_path}"
@@ -677,7 +734,37 @@ class _TrajectoryTab:
         meta = phase_meta.get("timeseries_outputs", {}).get(variable)
         if meta:
             return self._marker_trace(case, phase_meta, meta["path"])
+        if category == "defects":
+            meta = phase_meta.get("defect_outputs", {}).get(variable)
+            if meta:
+                return self._defect_marker_trace(case, phase_meta, meta["path"], meta.get("node_ptau"))
         return None, None
+
+    def _defect_output_trace(self, case, phase_meta, path, node_ptau):
+        try:
+            yraw = np.asarray(case.get_val(path))
+        except Exception:
+            return None, None, np.array([], dtype=bool), None
+        xvals = self._defect_xvals(case, phase_meta, yraw.shape[0], node_ptau)
+        yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, violation = _collapse_repeated_samples(xvals, yvals, np.zeros(len(np.asarray(xvals).reshape(-1)), dtype=bool))
+        return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float), violation, None
+
+    def _defect_marker_trace(self, case, phase_meta, path, node_ptau):
+        try:
+            yraw = np.asarray(case.get_val(path))
+        except Exception:
+            return None, None
+        xvals = self._defect_xvals(case, phase_meta, yraw.shape[0], node_ptau)
+        yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, _ = _collapse_repeated_samples(xvals, yvals)
+        return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float)
+
+    def _defect_xvals(self, case, phase_meta, count, node_ptau):
+        if node_ptau:
+            xvals = self._phase_time_from_ptau(case, phase_meta, node_ptau)
+            return np.asarray(xvals, dtype=float)
+        return self._timeseries_xvals(case, phase_meta, count)
 
     def _phase_time_from_ptau(self, case, phase_meta, node_ptau):
         t_initial = self._phase_initial_time(case, phase_meta)
@@ -805,9 +892,9 @@ class _SeriesTab:
         self._renderers = {}
         self._group_select.on_change("value", self._selection_changed)
         self._var_select.on_change("value", self._selection_changed)
-        controls = row(self._group_select, self._var_select, sizing_mode="stretch_width")
+        controls = row(self._group_select, self._var_select, sizing_mode="stretch_width", styles=_container_styles())
         self.panel = TabPanel(
-            child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"),
+            child=column(self._warning, controls, self._figure, sizing_mode="stretch_both", styles=_container_styles()),
             title=DASHBOARD_TAB_TITLES[SERIES_TAB],
         )
 
@@ -928,9 +1015,15 @@ class _JacobianEntriesTab:
         self._block_select.on_change("value", self._block_changed)
         self._entry_select.on_change("value", self._entry_changed)
         self._log_check.on_change("active", self._log_changed)
-        controls = row(self._block_select, self._entry_select, self._log_check, sizing_mode="stretch_width")
+        controls = row(
+            self._block_select,
+            self._entry_select,
+            self._log_check,
+            sizing_mode="stretch_width",
+            styles=_container_styles(),
+        )
         self.panel = TabPanel(
-            child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"),
+            child=column(self._warning, controls, self._figure, sizing_mode="stretch_both", styles=_container_styles()),
             title=DASHBOARD_TAB_TITLES[JACOBIAN_ENTRIES_TAB],
         )
 
@@ -1134,7 +1227,7 @@ class _JacobianHeatmapTab:
             source=self._col_highlight_source, fill_color="color", fill_alpha=0.14, line_color=None
         )
         self.panel = TabPanel(
-            child=column(self._warning, self._stats, self._figure, sizing_mode="stretch_both"),
+            child=column(self._warning, self._stats, self._figure, sizing_mode="stretch_both", styles=_container_styles()),
             title=DASHBOARD_TAB_TITLES[JACOBIAN_HEATMAP_TAB],
         )
 
@@ -1317,7 +1410,12 @@ class _JacobianHeatmapTab:
 class _RealTimeDymosDashboard:
     def __init__(self, case_tracker, callback_period, doc, pid_of_calling_script, script,
                  metadata=None, hist_file=None, highlight_jacobian_structure=True):
-        self._broker = LiveDataBroker(case_tracker, metadata=metadata, hist_file=hist_file)
+        recorder_filename = case_tracker.get_case_recorder_filename()
+        broker_tracker = type(case_tracker)(recorder_filename)
+        broker_tracker.set_source_process_pid(pid_of_calling_script)
+        plot_tracker = type(case_tracker)(recorder_filename)
+        plot_tracker.set_source_process_pid(pid_of_calling_script)
+        self._broker = LiveDataBroker(broker_tracker, metadata=metadata, hist_file=hist_file)
         self._doc = doc
         self._pid = pid_of_calling_script
         self._last_active = 0
@@ -1327,7 +1425,7 @@ class _RealTimeDymosDashboard:
         for tab_name in DASHBOARD_TAB_ORDER:
             tab_obj, panel = _build_dashboard_tab(
                 tab_name,
-                case_tracker,
+                plot_tracker if tab_name == CASE_PLOTTER_TAB else broker_tracker,
                 callback_period,
                 doc,
                 pid_of_calling_script,
