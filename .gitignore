@@ -220,3 +220,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#Scratch files
+*stdout.txt
+*stderr.txt
+multiphase_dymos_rtplot_mission_simtrue_tmp_out/coloring_files/total_coloring.pkl
+multiphase_dymos_rtplot_mission_simtrue_tmp_out/dymos_solution.db
+multiphase_dymos_rtplot_mission_simtrue_tmp_out/.openmdao_out
+multiphase_dymos_rtplot_mission_simtrue_tmp_out/IPOPT.out

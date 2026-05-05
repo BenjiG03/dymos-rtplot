@@ -69,6 +69,12 @@ _toggle_styles = """
 # Used for the outer bounds for the hstrips used to indicate the out of bounds for variables
 # TODO need to come up with a better way. But if made too big, get glitches in plots
 _bounds_infinity = 1e5
+_DARK_BG = "#0b1220"
+_DARK_PANEL = "#111827"
+_DARK_BORDER = "#334155"
+_DARK_TEXT = "#e5edf7"
+_DARK_MUTED = "#9fb0c7"
+_DARK_MODE_ENABLED = True
 
 # colors used for the plot lines and associated buttons and axes labels
 # start with color-blind friendly colors and then use others if needed
@@ -346,9 +352,17 @@ def _make_header_text_for_variable_chooser(header_text):
     """
     header_text_div = Div(
         text=f"<b>{header_text}</b>",
-        styles={"font-size": _variable_list_header_font_size},
+        styles={
+            "font-size": _variable_list_header_font_size,
+            **({"color": _DARK_TEXT} if _DARK_MODE_ENABLED else {}),
+        },
     )
     return header_text_div
+
+
+def _set_dark_mode_enabled(enabled):
+    global _DARK_MODE_ENABLED
+    _DARK_MODE_ENABLED = bool(enabled)
 
 
 class _RealTimeOptimizerPlot(_RealTimePlot):
@@ -411,7 +425,13 @@ class _RealTimeOptimizerPlot(_RealTimePlot):
         self._num_desvars = 0
 
         self._setup_figure()
-        self.layout = Column(Div(text="Waiting for optimizer data..."), sizing_mode="stretch_both")
+        layout_styles = {"background-color": _DARK_BG} if _DARK_MODE_ENABLED else {}
+        wait_styles = {"color": _DARK_TEXT} if _DARK_MODE_ENABLED else {}
+        self.layout = Column(
+            Div(text="Waiting for optimizer data...", styles=wait_styles),
+            sizing_mode="stretch_both",
+            styles=layout_styles,
+        )
 
         # used to keep track of the y min and max of the data so that
         # the axes ranges can be adjusted as data comes in
@@ -605,13 +625,24 @@ class _RealTimeOptimizerPlot(_RealTimePlot):
             children=self._column_items,
             sizing_mode="stretch_both",
             height_policy="fit",
-            styles={
-                "overflow-y": "auto",
-                "border": "1px solid #ddd",
-                "padding": "8px",
-                "background-color": "#dddddd",
-                "max-height": "100vh",  # Ensures it doesn't exceed viewport
-            },
+            styles=(
+                {
+                    "overflow-y": "auto",
+                    "border": f"1px solid {_DARK_BORDER}",
+                    "padding": "8px",
+                    "background-color": _DARK_PANEL,
+                    "color": _DARK_TEXT,
+                    "max-height": "100vh",
+                }
+                if _DARK_MODE_ENABLED else
+                {
+                    "overflow-y": "auto",
+                    "border": "1px solid #ddd",
+                    "padding": "8px",
+                    "background-color": "#dddddd",
+                    "max-height": "100vh",
+                }
+            ),
         )
 
         quit_button = Button(label="Quit Application", button_type="danger")
@@ -627,7 +658,11 @@ class _RealTimeOptimizerPlot(_RealTimePlot):
         label = Div(
             text="Variables",
             width=200,
-            styles={"font-size": "20px", "font-weight": "bold"},
+            styles={
+                "font-size": "20px",
+                "font-weight": "bold",
+                **({"color": _DARK_TEXT} if _DARK_MODE_ENABLED else {}),
+            },
         )
         label_and_toggle_column = Column(
             quit_button,
@@ -644,7 +679,12 @@ class _RealTimeOptimizerPlot(_RealTimePlot):
             height_policy="max",
         )
 
-        graph = Row(self.plot_figure, scroll_box, sizing_mode="stretch_both")
+        graph = Row(
+            self.plot_figure,
+            scroll_box,
+            sizing_mode="stretch_both",
+            styles={"background-color": _DARK_BG} if _DARK_MODE_ENABLED else {},
+        )
         self.layout.children = [graph]
 
     def _update(self):
@@ -1071,7 +1111,7 @@ class _RealTimeOptimizerPlot(_RealTimePlot):
         )
 
         self.plot_figure.title.text_font_size = "14px"
-        self.plot_figure.title.text_color = "black"
+        self.plot_figure.title.text_color = _DARK_TEXT if _DARK_MODE_ENABLED else "black"
         self.plot_figure.title.text_font = "arial"
         self.plot_figure.title.align = "left"
         self.plot_figure.title.standoff = 40  # Adds 40 pixels of space below the title
@@ -1084,3 +1124,12 @@ class _RealTimeOptimizerPlot(_RealTimePlot):
 
         self.plot_figure.axis.axis_label_text_font_style = "bold"
         self.plot_figure.axis.axis_label_text_font_size = "20pt"
+        if _DARK_MODE_ENABLED:
+            self.plot_figure.background_fill_color = _DARK_BG
+            self.plot_figure.border_fill_color = _DARK_BG
+            self.plot_figure.outline_line_color = _DARK_BORDER
+            self.plot_figure.xaxis.major_label_text_color = _DARK_TEXT
+            self.plot_figure.yaxis.major_label_text_color = _DARK_TEXT
+            self.plot_figure.xaxis.axis_label_text_color = _DARK_TEXT
+            self.plot_figure.yaxis.axis_label_text_color = _DARK_TEXT
+            self.plot_figure.grid.grid_line_color = "#223046"
