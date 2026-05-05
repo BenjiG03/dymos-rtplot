@@ -8,28 +8,15 @@ live trajectory views, optimizer diagnostics, and total-Jacobian inspection tabs
 From the repository root:
 
 ```powershell
-conda activate optview_tutorial
 python -m pip install -e .
 ```
 
-## Run the scratch mission
+## Run with a dymos problem
 
 ```powershell
-python -m dymos_rtplot.rtplot scratch\multiphase_dymos_rtplot_mission.py
+dymos-rtplot dymos_problem.py
 ```
 
-Or use the console script after the editable install:
-
-```powershell
-dymos-rtplot scratch\multiphase_dymos_rtplot_mission.py
-```
-
-You can also run the installed package directly:
-
-```powershell
-python -m dymos_rtplot scratch\multiphase_dymos_rtplot_mission.py
-```
-
-By default the realtime server now prints a `127.0.0.1` URL instead of trying to
-launch the system browser automatically. This avoids browser-launch policy issues
-on managed Windows machines. If you want the old behavior, add `--open-browser`.
+To avoid being blocked by windows firewall on some machines, the default behavior is to 
+only print the urls where the dashboard tabs are hosted. To have the dashboard open automatically,
+add --open-browser`.
