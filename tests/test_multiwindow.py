@@ -19,6 +19,20 @@ class _FakeCaseTracker:
         return self._is_optimizer
 
 
+class _FakeDriver:
+    def __init__(self, optimization=False, optimizer=None):
+        self.supports = {"optimization": optimization}
+        self.options = {}
+        if optimizer is not None:
+            self.options["optimizer"] = optimizer
+
+
+class _FakeProblem:
+    def __init__(self, name="problem", pathname=None):
+        self._name = name
+        self._metadata = {"name": name, "pathname": pathname or name}
+
+
 class _FakeBroker:
     def __init__(self, metadata=None):
         self.metadata = metadata or {}
@@ -305,6 +319,60 @@ class MultiWindowParsingTests(unittest.TestCase):
                 "case-plotter",
                 None,
             )
+
+    def test_multiwindow_skips_non_optimizer_driver_launch(self):
+        driver = _FakeDriver(optimization=False)
+        self.assertTrue(
+            realtime_plot._should_skip_dashboard_launch_for_driver(driver, "multiwindow")
+        )
+
+    def test_multiwindow_allows_optimizer_driver_launch(self):
+        driver = _FakeDriver(optimization=True)
+        self.assertFalse(
+            realtime_plot._should_skip_dashboard_launch_for_driver(driver, "multiwindow")
+        )
+
+    def test_tabbed_mode_allows_non_optimizer_driver_launch(self):
+        driver = _FakeDriver(optimization=False)
+        self.assertFalse(
+            realtime_plot._should_skip_dashboard_launch_for_driver(driver, "tabbed")
+        )
+
+    def test_driver_selector_ignores_simulation_subproblem_driver(self):
+        selector = realtime_plot._RtplotDriverSelector("multiwindow")
+        main_problem = _FakeProblem()
+        subproblem = _FakeProblem(
+            name="traj.phases.climb.integrator_subprob_0",
+            pathname="problem/traj.phases.climb.integrator_subprob_0",
+        )
+        optimizer_driver = _FakeDriver(optimization=True)
+        simulation_driver = _FakeDriver(optimization=False)
+
+        self.assertTrue(selector.accepts(main_problem, optimizer_driver))
+        self.assertFalse(selector.accepts(subproblem, simulation_driver))
+        self.assertTrue(selector.accepts(main_problem, optimizer_driver))
+
+    def test_driver_selector_keeps_first_tabbed_driver_primary(self):
+        selector = realtime_plot._RtplotDriverSelector("tabbed")
+        main_problem = _FakeProblem()
+        primary_driver = _FakeDriver(optimization=False)
+        internal_driver = _FakeDriver(optimization=False)
+
+        self.assertTrue(selector.accepts(main_problem, primary_driver))
+        self.assertFalse(selector.accepts(main_problem, internal_driver))
+
+    def test_driver_selector_rejects_nested_dymos_subproblem_before_primary(self):
+        selector = realtime_plot._RtplotDriverSelector("tabbed")
+        subproblem = _FakeProblem(
+            name="traj.phases.climb.integrator_subprob_0",
+            pathname="problem/traj.phases.climb.integrator_subprob_0",
+        )
+        main_problem = _FakeProblem()
+        internal_driver = _FakeDriver(optimization=False)
+        optimizer_driver = _FakeDriver(optimization=True)
+
+        self.assertFalse(selector.accepts(subproblem, internal_driver))
+        self.assertTrue(selector.accepts(main_problem, optimizer_driver))
 
     def test_multiwindow_parses_selected_tabs_and_core_assignments(self):
         tracker = _FakeCaseTracker(is_optimizer=True)

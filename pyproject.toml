@@ -15,6 +15,7 @@ authors = [
 dependencies = [
   "bokeh>=3",
   "dymos",
+  "matplotlib",
   "numpy",
   "openmdao",
 ]

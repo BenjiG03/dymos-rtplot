@@ -647,19 +647,18 @@ class _TrajectoryTab:
     def _control_trace(self, case, phase_meta, variable, derivative_order=0):
         if variable not in phase_meta["controls"]:
             return None, None, np.array([], dtype=bool), None
+        control_meta = phase_meta["controls"][variable]
+        if control_meta.get("control_type") == "polynomial":
+            return self._recorded_control_trace(case, phase_meta, variable, derivative_order)
         if "control_interp" not in phase_meta:
-            suffix = variable
-            if derivative_order == 1:
-                suffix = f"control_rates:{variable}_rate"
-            elif derivative_order == 2:
-                suffix = f"control_rates:{variable}_rate2"
-            else:
-                suffix = f"controls:{variable}"
-            return self._timeseries_trace(case, phase_meta, f"timeseries.{suffix}", boundary_state=phase_meta["controls"][variable])
+            return self._recorded_control_trace(case, phase_meta, variable, derivative_order)
 
         phase_path = phase_meta["promoted_path"]
-        control = np.asarray(case.get_val(f"{phase_path}.controls:{variable}"))
-        shape = tuple(phase_meta["controls"][variable]["shape"])
+        try:
+            control = np.asarray(case.get_val(control_meta.get("path", f"{phase_path}.controls:{variable}")))
+        except Exception:
+            return self._recorded_control_trace(case, phase_meta, variable, derivative_order)
+        shape = tuple(control_meta["shape"])
         size = int(np.prod(shape))
         control_flat = np.reshape(control, (control.shape[0], size))
         interp = phase_meta["control_interp"]
@@ -669,7 +668,10 @@ class _TrajectoryTab:
             mat = np.asarray(interp["D"], dtype=float)
         else:
             mat = np.asarray(interp["D2"], dtype=float)
-        dense_val = mat.dot(control_flat)
+        try:
+            dense_val = mat.dot(control_flat)
+        except ValueError:
+            return self._recorded_control_trace(case, phase_meta, variable, derivative_order)
         dense_x = self._physical_time(case, phase_meta)
         duration = _scalar_item(case.get_val(f"{phase_path}.t_duration"))
         if derivative_order == 1:
@@ -681,6 +683,36 @@ class _TrajectoryTab:
         violation = self._bounds_violation(yvals[:, np.newaxis], phase_meta["controls"][variable])
         dense_x, yvals, violation = _collapse_repeated_samples(dense_x, yvals, violation)
         return dense_x, np.asarray(yvals, dtype=float), violation, None
+
+    def _recorded_control_trace(self, case, phase_meta, variable, derivative_order=0):
+        meta = self._recorded_control_meta(phase_meta, variable, derivative_order)
+        if meta:
+            return self._timeseries_trace(case, phase_meta, meta["path"], boundary_state=phase_meta["controls"][variable])
+        suffix = f"controls:{variable}" if derivative_order == 0 else f"control_rates:{variable}_rate"
+        return self._timeseries_trace(
+            case,
+            phase_meta,
+            f"timeseries.{suffix}",
+            boundary_state=phase_meta["controls"][variable],
+            warning=f"Recorded timeseries for control {variable} is unavailable.",
+        )
+
+    def _recorded_control_meta(self, phase_meta, variable, derivative_order=0):
+        outputs = phase_meta.get("timeseries_outputs", {})
+        candidates = []
+        if derivative_order == 0:
+            candidates.extend((f"controls:{variable}", variable))
+        elif derivative_order == 1:
+            candidates.extend((f"control_rates:{variable}_rate", f"control_rates:{variable}", f"{variable}_rate"))
+        else:
+            candidates.extend((f"control_rates:{variable}_rate2", f"{variable}_rate2"))
+        for candidate in candidates:
+            if candidate in outputs:
+                return outputs[candidate]
+        for meta in outputs.values():
+            if meta.get("name") == variable and derivative_order == 0:
+                return meta
+        return None
 
     def _ode_trace(self, case, phase_meta, variable):
         meta = phase_meta.get("timeseries_outputs", {}).get(variable)
@@ -790,8 +822,14 @@ class _TrajectoryTab:
 
     def _control_marker_trace(self, case, phase_meta, variable):
         phase_path = phase_meta["promoted_path"]
+        control_meta = phase_meta.get("controls", {}).get(variable, {})
+        if control_meta.get("control_type") == "polynomial":
+            meta = self._recorded_control_meta(phase_meta, variable, 0)
+            if meta:
+                return self._marker_trace(case, phase_meta, meta["path"])
+            return None, None
         try:
-            yraw = np.asarray(case.get_val(f"{phase_path}.controls:{variable}"))
+            yraw = np.asarray(case.get_val(control_meta.get("path", f"{phase_path}.controls:{variable}")))
         except Exception:
             return None, None
 
@@ -1441,8 +1479,25 @@ class _RealTimeDymosDashboard:
         )
         self._tabs.on_change("active", self._active_tab_changed)
         self._doc.add_root(self._tabs)
+        self._bootstrap_existing_data()
         self._doc.add_periodic_callback(self._update, callback_period)
         self._doc.title = "Dymos RTPlot Dashboard"
+
+    def _bootstrap_existing_data(self):
+        """Populate a new Bokeh session from recorder rows already on disk."""
+        try:
+            self._tab_objects[CASE_PLOTTER_TAB]._update_wrapped_in_try()
+            self._broker.poll()
+            if not self._broker.snapshots:
+                return
+            self._tab_objects[TRAJECTORY_TAB].refresh(force=True)
+            self._tab_objects[SERIES_TAB].refresh(force=True)
+            active_name = DASHBOARD_TAB_ORDER[self._tabs.active]
+            if active_name in _HEAVY_TABS:
+                self._tab_objects[active_name].refresh(force=True)
+                self._tab_rendered[active_name] = True
+        except Exception as exc:
+            print(f"Dashboard session bootstrap will retry after refresh error: {exc}")
 
     def _active_tab_changed(self, attr, old, new):
         if not self._broker.snapshots:
@@ -1530,6 +1585,7 @@ class _StandaloneDashboardTabApp:
             highlight_jacobian_structure=highlight_jacobian_structure,
         )
         self._doc.add_root(panel.child)
+        self._update()
         self._doc.add_periodic_callback(self._update, callback_period)
         self._doc.title = f"Dymos RTPlot - {DASHBOARD_TAB_TITLES[tab_name]}"
 

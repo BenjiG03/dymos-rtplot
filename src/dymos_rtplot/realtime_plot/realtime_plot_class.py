@@ -39,8 +39,7 @@ try:
             try:
                 self._update()
             except Exception as e:
-                print(f"Fatal error in periodic callback: {e}")
-                IOLoop.current().stop()
+                print(f"Realtime plot update will retry after refresh error: {e}")
                 return
 except ImportError:
     class _RealTimePlot(object):

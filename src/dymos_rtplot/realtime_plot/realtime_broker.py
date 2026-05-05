@@ -3,23 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 
-try:
-    from pyoptsparse.pyOpt_history import History
-except Exception:  # pragma: no cover
-    History = None
-
-
-_HISTORY_EXCLUDED_KEYS = {
-    "funcs",
-    "funcsSens",
-    "xuser",
-    "isMajor",
-    "fail",
-}
+from dymos_rtplot.realtime_plot.realtime_data import OptimizerHistoryAccess
 
 
 def _to_numpy(value):
@@ -56,10 +43,11 @@ class BrokerSnapshot:
 class LiveDataBroker:
     """Poll driver cases and optional optimizer history into a unified stream."""
 
-    def __init__(self, case_tracker, metadata=None, hist_file=None):
+    def __init__(self, case_tracker, metadata=None, hist_file=None, history_access=None):
         self.case_tracker = case_tracker
         self.metadata = metadata or {}
         self.hist_file = hist_file or self.metadata.get("hist_file")
+        self._history_access = history_access or OptimizerHistoryAccess(self.hist_file)
         self.snapshots = []
         self.warning_messages = []
         self._next_counter = 1
@@ -72,7 +60,14 @@ class LiveDataBroker:
         """Read all new major iterations available right now."""
         new_snapshots = []
         while True:
-            case = self.case_tracker.get_case_by_counter(self._next_counter)
+            try:
+                case = self.case_tracker.get_case_by_counter(self._next_counter)
+            except Exception as exc:
+                print(
+                    "LiveDataBroker will retry unreadable driver case row "
+                    f"{self._next_counter} on the next refresh: {exc}"
+                )
+                break
             if case is None:
                 break
             try:
@@ -115,39 +110,16 @@ class LiveDataBroker:
         )
 
     def _reload_history_if_needed(self):
-        if not self.hist_file or History is None:
+        snapshot = self._history_access.read_if_changed(self._history_mtime)
+        if snapshot is None:
             return
 
-        hist_path = Path(self.hist_file)
-        if not hist_path.exists():
+        if snapshot.warning:
+            self._history_aligned_warning = snapshot.warning
             return
-
-        mtime = hist_path.stat().st_mtime
-        if self._history_mtime is not None and mtime == self._history_mtime:
-            return
-
-        try:
-            hist = History(str(hist_path), flag="r")
-        except Exception as exc:
-            self._history_aligned_warning = f"Unable to read optimizer history: {exc}"
-            return
-
-        iter_keys = [key for key in hist.getIterKeys() if key not in _HISTORY_EXCLUDED_KEYS]
-        values = hist.getValues(names=iter_keys, major=True, scale=False) if iter_keys else {}
-        entries = []
-        num_rows = 0
-        if values:
-            num_rows = max(value.shape[0] for value in values.values())
-
-        for row_idx in range(num_rows):
-            entry = {}
-            for key in iter_keys:
-                entry[key] = values[key][row_idx]
-            entries.append(entry)
-
-        self._history_cache = entries
-        self._history_keys = iter_keys
-        self._history_mtime = mtime
+        self._history_cache = snapshot.entries
+        self._history_keys = snapshot.keys
+        self._history_mtime = snapshot.mtime
 
     def _align_history(self):
         if not self.snapshots:
