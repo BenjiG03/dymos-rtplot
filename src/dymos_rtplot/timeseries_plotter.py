@@ -481,6 +481,15 @@ class TimeseriesDataset:
         key = self.aliases.get(name, name)
         return self.series[key]
 
+    def alias_for(self, name):
+        candidates = [
+            alias for alias, target in self.aliases.items()
+            if target == name and alias != name
+        ]
+        if not candidates:
+            return _sanitize_identifier(name)
+        return sorted(candidates, key=lambda item: (len(item), item))[0]
+
     def add_derived_series(self, spec):
         evaluator = FormulaEvaluator(self.series, aliases=self.aliases)
         result = evaluator.evaluate(spec.expression, name=spec.name)
@@ -742,12 +751,22 @@ def _find_default_trace(series):
         if data.variable in {"time", "time_phase"} or name.endswith(".timeseries.time")
     ]
     x_name = time_candidates[0] if time_candidates else names[0]
+    x_series = series[x_name]
     y_candidates = [
         name for name, data in series.items()
         if name != x_name and data.variable not in {"time", "time_phase"}
     ]
     if not y_candidates:
         return None
+    matching_context = [
+        name for name in y_candidates
+        if series[name].source == x_series.source
+        and series[name].trajectory == x_series.trajectory
+        and series[name].phase == x_series.phase
+        and series[name].length == x_series.length
+    ]
+    if matching_context:
+        y_candidates = matching_context
     priority = {"states": 0, "controls": 1, "ode": 2, "state_rates": 3, "control_rates": 4}
     y_name = sorted(
         y_candidates,
@@ -829,14 +848,31 @@ class TimeseriesPlotterApp:
         main.pack(fill=tk.BOTH, expand=True)
         left = ttk.Frame(main, padding=6)
         center = ttk.Frame(main, padding=6)
-        right = ttk.Frame(main, padding=6)
+        right_outer = ttk.Frame(main)
         main.add(left, weight=1)
         main.add(center, weight=3)
-        main.add(right, weight=1)
+        main.add(right_outer, weight=1)
+        right_canvas = tk.Canvas(right_outer, highlightthickness=0)
+        right_scrollbar = ttk.Scrollbar(right_outer, orient=tk.VERTICAL, command=right_canvas.yview)
+        right = ttk.Frame(right_canvas, padding=6)
+        right_window = right_canvas.create_window((0, 0), window=right, anchor=tk.NW)
+        right_canvas.configure(yscrollcommand=right_scrollbar.set)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def resize_right_panel(event):
+            right_canvas.itemconfigure(right_window, width=event.width)
+
+        def update_right_scroll_region(_event=None):
+            right_canvas.configure(scrollregion=right_canvas.bbox(tk.ALL))
+
+        right_canvas.bind("<Configure>", resize_right_panel)
+        right.bind("<Configure>", update_right_scroll_region)
 
         search_var = tk.StringVar()
         x_pick_var = tk.StringVar()
         y_pick_var = tk.StringVar()
+        selected_alias_var = tk.StringVar()
 
         ttk.Label(left, text="Search").pack(anchor=tk.W)
         search_entry = ttk.Entry(left, textvariable=search_var)
@@ -856,6 +892,7 @@ class TimeseriesPlotterApp:
         ttk.Button(pick_frame, text="Use as Y", command=lambda: set_pick("y")).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(left, textvariable=x_pick_var, wraplength=340).pack(anchor=tk.W, pady=(6, 0))
         ttk.Label(left, textvariable=y_pick_var, wraplength=340).pack(anchor=tk.W)
+        ttk.Label(left, textvariable=selected_alias_var, wraplength=340).pack(anchor=tk.W)
         ttk.Button(left, text="Add Trace", command=lambda: add_trace_from_picks()).pack(fill=tk.X, pady=(6, 0))
 
         ttk.Label(left, text="Derived Series").pack(anchor=tk.W, pady=(12, 0))
@@ -873,6 +910,7 @@ class TimeseriesPlotterApp:
             text="Use series names or aliases. Example: unit(thrust, 'lbf') / unit(mass_rate, 'lbm/s')",
             wraplength=340,
         ).pack(anchor=tk.W)
+        ttk.Button(left, text="Insert Selected Alias", command=lambda: insert_selected_alias()).pack(fill=tk.X)
         ttk.Button(left, text="Add Derived Series", command=lambda: add_derived()).pack(fill=tk.X)
 
         trace_cols = ("x", "y", "axes", "label")
@@ -1000,6 +1038,19 @@ class TimeseriesPlotterApp:
                 return None
             return self._series_rows.get(selection[0])
 
+        def update_selected_alias(*_args):
+            name = selected_series_name()
+            if not name:
+                selected_alias_var.set("")
+                return
+            selected_alias_var.set(f"Alias for formulas: {self.dataset.alias_for(name)}")
+
+        def insert_selected_alias():
+            name = selected_series_name()
+            if not name:
+                return
+            derived_expr.insert(tk.INSERT, self.dataset.alias_for(name))
+
         def set_pick(which):
             name = selected_series_name()
             if not name:
@@ -1095,6 +1146,8 @@ class TimeseriesPlotterApp:
             trace = selected_trace()
             if not trace:
                 return
+            old_x = trace.x
+            old_y = trace.y
             trace.x = trace_style_vars["x"].get()
             trace.y = trace_style_vars["y"].get()
             trace.label = trace_style_vars["label"].get() or None
@@ -1107,7 +1160,7 @@ class TimeseriesPlotterApp:
             trace.style.marker_size = parse_float(trace_style_vars["marker_size"].get(), 5.0)
             trace.style.marker_face_color = trace_style_vars["marker_face_color"].get() or None
             trace.style.marker_edge_color = trace_style_vars["marker_edge_color"].get() or None
-            apply_auto_axis_defaults()
+            apply_auto_axis_defaults(replace=(trace.x != old_x or trace.y != old_y))
             refresh_trace_table()
             redraw()
 
@@ -1229,6 +1282,7 @@ class TimeseriesPlotterApp:
             return float(text)
 
         search_var.trace_add("write", refresh_browser)
+        browser.bind("<<TreeviewSelect>>", update_selected_alias)
         trace_table.bind("<<TreeviewSelect>>", load_trace_into_editor)
         refresh_browser()
         refresh_trace_table()

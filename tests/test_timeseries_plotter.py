@@ -71,6 +71,7 @@ class TimeseriesDatasetTests(unittest.TestCase):
         self.assertEqual(dataset.series["traj.phase0.timeseries.states:x"].units, "m")
         matches = dataset.search("phase0 x")
         self.assertEqual([item.name for item in matches], ["traj.phase0.timeseries.states:x"])
+        self.assertEqual(dataset.alias_for("traj.phase0.timeseries.states:x"), "x")
 
     def test_auto_loads_simulation_db_next_to_solution_db(self):
         with TemporaryDirectory() as tmp:
@@ -160,6 +161,15 @@ class FormulaEvaluatorTests(unittest.TestCase):
 class RenderingTests(unittest.TestCase):
     def test_default_trace_uses_time_for_x_and_populates_axis_defaults(self):
         series = {
+            "traj.other.timeseries.states:z": SeriesData(
+                "traj.other.timeseries.states:z",
+                np.array([9.0, 10.0, 11.0]),
+                "m",
+                source="solution",
+                phase="other",
+                category="states",
+                variable="z",
+            ),
             "traj.phase.timeseries.controls:u": SeriesData(
                 "traj.phase.timeseries.controls:u",
                 np.array([3.0, 4.0]),
@@ -193,13 +203,13 @@ class RenderingTests(unittest.TestCase):
         settings = apply_trace_axis_defaults(PlotSettings(), [trace], series, replace=True)
 
         self.assertEqual(trace.x, "traj.phase.timeseries.time")
-        self.assertEqual(trace.y, "traj.phase.timeseries.controls:u")
+        self.assertEqual(trace.y, "traj.phase.timeseries.states:x")
         self.assertEqual(settings.axis("x1").label, "solution phase time (s)")
         self.assertEqual(settings.axis("x1").minimum, 0.0)
         self.assertEqual(settings.axis("x1").maximum, 10.0)
-        self.assertEqual(settings.axis("y1").label, "solution phase u (deg)")
-        self.assertEqual(settings.axis("y1").minimum, 3.0)
-        self.assertEqual(settings.axis("y1").maximum, 4.0)
+        self.assertEqual(settings.axis("y1").label, "solution phase x (m)")
+        self.assertEqual(settings.axis("y1").minimum, 1.0)
+        self.assertEqual(settings.axis("y1").maximum, 2.0)
 
     def test_render_supports_secondary_x_and_y_axes_and_styles(self):
         series = {
