@@ -2,10 +2,16 @@
 Classes and functions to support the realtime plotting.
 """
 
+import ctypes
+from ctypes import wintypes
+import multiprocessing
 import os
+import queue
+import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import webbrowser
 from pathlib import Path
 
@@ -18,17 +24,32 @@ from openmdao.utils.gui_testing_utils import get_free_port
 from openmdao.utils.record_util import check_valid_sqlite3_db
 from dymos_rtplot.realtime_plot.realtime_analysis_driver_plot \
     import _RealTimeAnalysisDriverPlot
-from dymos_rtplot.realtime_plot.realtime_dashboard import _RealTimeDymosDashboard
+from dymos_rtplot.realtime_plot.realtime_dashboard import (
+    CASE_PLOTTER_TAB,
+    DASHBOARD_TAB_TITLES,
+    JACOBIAN_ENTRIES_TAB,
+    JACOBIAN_HEATMAP_TAB,
+    SERIES_TAB,
+    TRAJECTORY_TAB,
+    _RealTimeDymosDashboard,
+    _StandaloneDashboardTabApp,
+    _set_dark_mode_enabled as _set_dashboard_dark_mode_enabled,
+    get_dashboard_tab_names,
+)
 from dymos_rtplot.realtime_plot.realtime_metadata import (
     load_rtplot_metadata,
     write_rtplot_metadata,
 )
-from dymos_rtplot.realtime_plot.realtime_optimizer_plot import _RealTimeOptimizerPlot
+from dymos_rtplot.realtime_plot.realtime_optimizer_plot import (
+    _RealTimeOptimizerPlot,
+    _set_dark_mode_enabled as _set_optimizer_dark_mode_enabled,
+)
 
 try:
     from bokeh.server.server import Server
     from bokeh.application.application import Application
     from bokeh.application.handlers import FunctionHandler
+    from bokeh.themes import Theme
     from tornado.ioloop import PeriodicCallback
     from tornado.web import StaticFileHandler
 
@@ -44,6 +65,367 @@ _time_between_callbacks_in_ms = 300
 
 # Number of milliseconds for unused session lifetime
 _unused_session_lifetime_milliseconds = 1000 * 60 * 10
+
+_DASHBOARD_MODE_TABBED = 'tabbed'
+_DASHBOARD_MODE_MULTIWINDOW = 'multiwindow'
+_DASHBOARD_MODE_CHOICES = (_DASHBOARD_MODE_TABBED, _DASHBOARD_MODE_MULTIWINDOW)
+_MULTIWINDOW_STARTUP_TIMEOUT = 30.0
+_DEFAULT_MULTIWINDOW_BASE_PORT = 57003
+_CHILD_IDLE_SHUTDOWN_SECONDS = 15.0
+_CHILD_IDLE_CHECK_PERIOD_MS = 1000
+_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE = True
+_DEFAULT_DARK_MODE = True
+_DARK_THEME_JSON = {
+    "attrs": {
+        "figure": {
+            "background_fill_color": "#10141f",
+            "border_fill_color": "#10141f",
+            "outline_line_color": "#374151",
+        },
+        "Grid": {
+            "grid_line_color": "#243042",
+            "grid_line_alpha": 0.45,
+        },
+        "Axis": {
+            "major_label_text_color": "#dbe4f0",
+            "axis_label_text_color": "#f3f4f6",
+            "major_tick_line_color": "#8b9bb4",
+            "minor_tick_line_color": "#55637a",
+            "axis_line_color": "#8b9bb4",
+        },
+        "Title": {
+            "text_color": "#f3f4f6",
+        },
+        "Legend": {
+            "label_text_color": "#dbe4f0",
+            "background_fill_color": "#111827",
+            "border_line_color": "#374151",
+        },
+        "ColorBar": {
+            "background_fill_color": "#10141f",
+            "major_label_text_color": "#dbe4f0",
+            "title_text_color": "#f3f4f6",
+        },
+        "BaseColorBar": {
+            "background_fill_color": "#10141f",
+        },
+        "Tabs": {
+            "tabs_location": "above",
+        },
+    }
+}
+
+
+def _apply_dark_theme(doc, enabled=True):
+    if not bokeh_and_dependencies_available or not enabled:
+        return
+    doc.theme = Theme(json=_DARK_THEME_JSON)
+
+
+def _readonly_sqlite_connection(path):
+    db_uri = Path(path).resolve().as_uri().replace("file:///", "file:///") + "?mode=ro"
+    return sqlite3.connect(db_uri, uri=True)
+
+
+def clean_rtplot_artifacts(root_dir=".", dry_run=False):
+    root = Path(root_dir).resolve()
+    file_patterns = (
+        "*.sqlite",
+        "*.sqlite.rtplot_meta.json",
+        "*.hst",
+    )
+    dir_patterns = (
+        "*_out",
+    )
+    removed_files = []
+    removed_dirs = []
+
+    for pattern in file_patterns:
+        for path in root.rglob(pattern):
+            if not path.is_file():
+                continue
+            removed_files.append(path)
+            if not dry_run:
+                path.unlink(missing_ok=True)
+
+    for pattern in dir_patterns:
+        for path in root.rglob(pattern):
+            if not path.is_dir():
+                continue
+            removed_dirs.append(path)
+            if not dry_run:
+                shutil.rmtree(path, ignore_errors=True)
+
+    return {
+        "root": str(root),
+        "dry_run": dry_run,
+        "files": [str(path) for path in sorted(set(removed_files))],
+        "dirs": [str(path) for path in sorted(set(removed_dirs))],
+    }
+
+
+def _parse_csv_items(value):
+    if value is None:
+        return []
+    return [item.strip() for item in value.split(',') if item.strip()]
+
+
+def _normalize_dashboard_tabs(value):
+    known_tabs = get_dashboard_tab_names()
+    if value is None:
+        return list(known_tabs)
+
+    seen = set()
+    selected = []
+    for item in _parse_csv_items(value):
+        if item not in known_tabs:
+            valid = ", ".join(known_tabs)
+            raise ValueError(f"Unknown tab '{item}'. Expected one of: {valid}.")
+        if item not in seen:
+            seen.add(item)
+            selected.append(item)
+
+    if not selected:
+        raise ValueError("At least one dashboard tab must be selected.")
+    return selected
+
+
+def _parse_tab_core_assignments(value):
+    assignments = {}
+    if value is None:
+        return assignments
+
+    for item in _parse_csv_items(value):
+        if '=' not in item:
+            raise ValueError(
+                f"Invalid tab/core assignment '{item}'. Expected format tab=core."
+            )
+        tab_name, core_text = item.split('=', 1)
+        tab_name = tab_name.strip()
+        core_text = core_text.strip()
+        if not tab_name or not core_text:
+            raise ValueError(
+                f"Invalid tab/core assignment '{item}'. Expected format tab=core."
+            )
+        try:
+            core = int(core_text)
+        except ValueError as err:
+            raise ValueError(f"CPU core for '{tab_name}' must be an integer.") from err
+        assignments[tab_name] = core
+    return assignments
+
+
+def _validate_core_number(core):
+    cpu_count = os.cpu_count()
+    if core < 0:
+        raise ValueError(f"CPU core index must be non-negative, got {core}.")
+    if cpu_count is not None and core >= cpu_count:
+        raise ValueError(
+            f"CPU core index {core} is out of range for this machine ({cpu_count} cores)."
+        )
+    if sys.platform.startswith('win'):
+        max_bits = ctypes.sizeof(ctypes.c_size_t) * 8
+        if core >= max_bits:
+            raise ValueError(
+                f"CPU core index {core} exceeds Windows affinity mask width ({max_bits} bits)."
+            )
+
+
+def _resolve_dashboard_launch_config(case_tracker, dashboard_mode, tabs_value, tab_core_value):
+    if dashboard_mode == _DASHBOARD_MODE_TABBED:
+        if tabs_value:
+            raise ValueError("--tabs is only supported with --dashboard-mode multiwindow.")
+        if tab_core_value:
+            raise ValueError("--tab-core is only supported with --dashboard-mode multiwindow.")
+        return [], {}
+
+    if not case_tracker.is_driver_optimizer():
+        raise ValueError(
+            "--dashboard-mode multiwindow is only available for the optimizer dashboard."
+        )
+
+    selected_tabs = _normalize_dashboard_tabs(tabs_value)
+    core_assignments = _parse_tab_core_assignments(tab_core_value)
+    known_tabs = set(get_dashboard_tab_names())
+    for tab_name, core in core_assignments.items():
+        if tab_name not in known_tabs:
+            valid = ", ".join(get_dashboard_tab_names())
+            raise ValueError(f"Unknown tab '{tab_name}' in --tab-core. Expected one of: {valid}.")
+        if tab_name not in selected_tabs:
+            raise ValueError(
+                f"Tab '{tab_name}' was assigned a CPU core but is not included in --tabs."
+            )
+        _validate_core_number(core)
+    return selected_tabs, core_assignments
+
+
+def _port_for_dashboard_tab(tab_name, base_port):
+    tab_names = get_dashboard_tab_names()
+    if tab_name not in tab_names:
+        valid = ", ".join(tab_names)
+        raise ValueError(f"Unknown tab '{tab_name}'. Expected one of: {valid}.")
+    return base_port + tab_names.index(tab_name)
+
+
+def _set_process_cpu_affinity(core):
+    _validate_core_number(core)
+    if sys.platform.startswith('win'):
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+        kernel32.SetProcessAffinityMask.restype = wintypes.BOOL
+        process_handle = kernel32.GetCurrentProcess()
+        mask_value = ctypes.c_size_t(1 << core).value
+        if not kernel32.SetProcessAffinityMask(process_handle, mask_value):
+            error_code = ctypes.get_last_error()
+            raise OSError(
+                f"SetProcessAffinityMask failed for CPU core {core} with Win32 error {error_code}."
+            )
+        return
+    if hasattr(os, 'sched_setaffinity'):
+        os.sched_setaffinity(0, {core})
+        return
+    print(f"CPU affinity is not supported on this platform; ignoring requested core {core}.")
+
+
+def _source_process_running(pid_of_calling_script):
+    if pid_of_calling_script is None:
+        return False
+    try:
+        from openmdao.utils.shell_proc import _is_process_running
+        return _is_process_running(pid_of_calling_script)
+    except Exception:
+        return False
+
+
+def _count_active_server_connections(server):
+    active_connections = 0
+    for session in server.get_sessions("/"):
+        connection_count = getattr(session, "connection_count", 0)
+        destroyed = getattr(session, "destroyed", False)
+        if connection_count > 0 and not destroyed:
+            active_connections += connection_count
+    return active_connections
+
+
+def _make_child_session_monitor(server, tab_name, pid_of_calling_script,
+                                idle_shutdown_seconds=_CHILD_IDLE_SHUTDOWN_SECONDS,
+                                now_fn=time.time):
+    idle_since = None
+
+    def _check():
+        nonlocal idle_since
+
+        active_connections = _count_active_server_connections(server)
+        if active_connections > 0:
+            idle_since = None
+            return
+
+        now = now_fn()
+        if idle_since is None:
+            idle_since = now
+            return
+
+        source_alive = True
+        if pid_of_calling_script is not None:
+            source_alive = _source_process_running(pid_of_calling_script)
+
+        if not source_alive or (now - idle_since) >= idle_shutdown_seconds:
+            if pid_of_calling_script is not None and not source_alive:
+                reason = "source process ended and no active browser sessions remain"
+            else:
+                reason = (
+                    f"no active browser sessions for {idle_shutdown_seconds:g} seconds"
+                )
+            print(f"Stopping {DASHBOARD_TAB_TITLES[tab_name]} server: {reason}")
+            server.io_loop.stop()
+
+    return _check
+
+
+def _append_dashboard_launch_args(cmd, options):
+    if getattr(options, 'open_browser', False):
+        cmd.append('--open-browser')
+    if getattr(options, 'host', None):
+        cmd.extend(['--host', options.host])
+    if getattr(options, 'dashboard_mode', None):
+        cmd.extend(['--dashboard-mode', options.dashboard_mode])
+    if getattr(options, 'tabs', None):
+        cmd.extend(['--tabs', options.tabs])
+    if getattr(options, 'tab_core', None):
+        cmd.extend(['--tab-core', options.tab_core])
+    if getattr(options, 'base_port', None) is not None:
+        cmd.extend(['--base-port', str(options.base_port)])
+    if getattr(options, 'idle_shutdown_seconds', None) is not None:
+        cmd.extend(['--idle-shutdown-seconds', str(options.idle_shutdown_seconds)])
+    if not getattr(options, 'highlight_jacobian_structure', _DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE):
+        cmd.append('--disable-jacobian-highlighting')
+    if not getattr(options, 'dark_mode', _DEFAULT_DARK_MODE):
+        cmd.append('--light-mode')
+
+
+def _add_dashboard_cli_arguments(parser):
+    parser.add_argument(
+        '-b', '--open-browser',
+        action='store_true',
+        help='Attempt to open the dashboard URL in the system browser.',
+    )
+    parser.add_argument(
+        '-H', '--host',
+        type=str,
+        default='127.0.0.1',
+        help='Host interface to bind the Bokeh server to. Defaults to 127.0.0.1.',
+    )
+    parser.add_argument(
+        '-m', '--dashboard-mode',
+        choices=_DASHBOARD_MODE_CHOICES,
+        default=_DASHBOARD_MODE_TABBED,
+        help='Launch the optimizer dashboard in one tabbed window or as separate per-tab windows.',
+    )
+    parser.add_argument(
+        '-t', '--tabs',
+        type=str,
+        default=None,
+        help='Comma-separated dashboard tabs to launch in multiwindow mode.',
+    )
+    parser.add_argument(
+        '-c', '--tab-core',
+        type=str,
+        default=None,
+        help='Comma-separated CPU affinity assignments in the form tab=core for multiwindow mode.',
+    )
+    parser.add_argument(
+        '-p', '--base-port',
+        type=int,
+        default=_DEFAULT_MULTIWINDOW_BASE_PORT,
+        help='Base port for deterministic multiwindow tab URLs. Tab ports are assigned by tab order offset.',
+    )
+    parser.add_argument(
+        '-s', '--idle-shutdown-seconds',
+        type=float,
+        default=_CHILD_IDLE_SHUTDOWN_SECONDS,
+        help='Seconds a multiwindow child tab stays alive with zero browser sessions before exiting.',
+    )
+    parser.add_argument(
+        '-J', '--disable-jacobian-highlighting',
+        action='store_false',
+        dest='highlight_jacobian_structure',
+        default=_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE,
+        help='Disable zero/dependent row and column highlighting in the Jacobian heatmap tab.',
+    )
+    parser.add_argument(
+        '-D', '--dark-mode',
+        action='store_true',
+        dest='dark_mode',
+        default=_DEFAULT_DARK_MODE,
+        help='Enable the dark dashboard theme.',
+    )
+    parser.add_argument(
+        '-L', '--light-mode',
+        action='store_false',
+        dest='dark_mode',
+        help='Disable the dark dashboard theme.',
+    )
 
 
 def _realtime_plot_setup_parser(parser):
@@ -75,17 +457,7 @@ def _realtime_plot_setup_parser(parser):
                         help='Optional metadata sidecar for the richer dashboard.')
     parser.add_argument('--hist-file', type=str, default=None,
                         help='Optional pyOptSparse history file.')
-    parser.add_argument(
-        '--open-browser',
-        action='store_true',
-        help='Attempt to open the dashboard URL in the system browser.',
-    )
-    parser.add_argument(
-        '--host',
-        type=str,
-        default='127.0.0.1',
-        help='Host interface to bind the Bokeh server to. Defaults to 127.0.0.1.',
-    )
+    _add_dashboard_cli_arguments(parser)
 
 
 def _realtime_plot_cmd(options, user_args):
@@ -109,6 +481,13 @@ def _realtime_plot_cmd(options, user_args):
             options.hist_file,
             options.open_browser,
             options.host,
+            options.dashboard_mode,
+            options.tabs,
+            options.tab_core,
+            options.base_port,
+            options.idle_shutdown_seconds,
+            options.highlight_jacobian_structure,
+            options.dark_mode,
         )
     else:
         print(
@@ -128,6 +507,7 @@ def _rtplot_setup_parser(parser):
         The parser we're adding options to.
     """
     parser.add_argument('file', nargs=1, help='Python file containing the model.')
+    _add_dashboard_cli_arguments(parser)
 
 
 def _rtplot_cmd(options, user_args):
@@ -171,7 +551,6 @@ def _rtplot_cmd(options, user_args):
 
         cmd = [sys.executable, '-m', 'dymos_rtplot.rtplot',
                'realtime_plot', '--pid', str(os.getpid()),
-               '--host', '127.0.0.1',
                '--meta-file', str(meta_path),
                case_recorder_file]
         if hist_file:
@@ -180,6 +559,7 @@ def _rtplot_cmd(options, user_args):
         if script_path:
             cmd.insert(-1, '--script')
             cmd.insert(-1, script_path)
+        _append_dashboard_launch_args(cmd, options)
         cp = subprocess.Popen(cmd)  # nosec: trusted input
 
         # Do a quick non-blocking check to see if it immediately failed
@@ -203,13 +583,12 @@ def _rtplot_cmd(options, user_args):
             "realtime_plot",
             "--pid",
             str(os.getpid()),
-            "--host",
-            "127.0.0.1",
             case_recorder_file,
         ]
         if meta_path:
             cmd.insert(-1, '--meta-file')
             cmd.insert(-1, meta_path)
+        _append_dashboard_launch_args(cmd, options)
 
         cp = subprocess.Popen(cmd)  # nosec: trusted input
 
@@ -309,7 +688,7 @@ class _CaseRecorderTracker:
 
     def _get_case_by_counter(self, counter):
         # use SQL to see if a case with this counter exists
-        with sqlite3.connect(self._case_recorder_filename) as con:
+        with _readonly_sqlite_connection(self._case_recorder_filename) as con:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
             cur.execute(
@@ -423,9 +802,201 @@ class _CaseRecorderTracker:
         return item.size
 
 
+def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_filename,
+                                 callback_period, pid_of_calling_script, script,
+                                 meta_file, hist_file, host, port_number,
+                                 idle_shutdown_seconds, highlight_jacobian_structure,
+                                 dark_mode):
+    server = None
+    idle_callback = None
+    try:
+        if core is not None:
+            _set_process_cpu_affinity(core)
+
+        app_url = f"http://{host}:{port_number}/"
+
+        def _make_tab_doc(doc):
+            _set_dashboard_dark_mode_enabled(dark_mode)
+            _set_optimizer_dark_mode_enabled(dark_mode)
+            _apply_dark_theme(doc, enabled=dark_mode)
+            case_tracker = _CaseRecorderTracker(case_recorder_filename)
+            case_tracker.set_source_process_pid(pid_of_calling_script)
+            metadata = load_rtplot_metadata(
+                meta_file=meta_file,
+                case_recorder_filename=case_recorder_filename,
+            )
+            if tab_name == CASE_PLOTTER_TAB:
+                _RealTimeOptimizerPlot(
+                    case_tracker,
+                    callback_period,
+                    doc,
+                    pid_of_calling_script,
+                    script,
+                    add_root=True,
+                    start_callback=True,
+                )
+                doc.title = f"Dymos RTPlot - {DASHBOARD_TAB_TITLES[tab_name]}"
+            else:
+                _StandaloneDashboardTabApp(
+                    tab_name,
+                    case_tracker,
+                    callback_period,
+                    doc,
+                    pid_of_calling_script,
+                    script,
+                    metadata=metadata,
+                    hist_file=hist_file,
+                    highlight_jacobian_structure=highlight_jacobian_structure,
+                )
+
+        server = Server(
+            {"/": Application(FunctionHandler(_make_tab_doc))},
+            address=host,
+            port=port_number,
+            allow_websocket_origin=[f"{host}:{port_number}"],
+            unused_session_lifetime_milliseconds=_unused_session_lifetime_milliseconds,
+            extra_patterns=[
+                (
+                    "/images/(.*)",
+                    StaticFileHandler,
+                    {"path": os.path.normpath(os.path.dirname(__file__) + "/images/")},
+                ),
+            ],
+        )
+        server.start()
+        idle_callback = PeriodicCallback(
+            _make_child_session_monitor(
+                server,
+                tab_name,
+                pid_of_calling_script,
+                idle_shutdown_seconds=idle_shutdown_seconds,
+            ),
+            _CHILD_IDLE_CHECK_PERIOD_MS,
+        )
+        idle_callback.start()
+        startup_queue.put({
+            "status": "started",
+            "tab": tab_name,
+            "url": app_url,
+        })
+        print(f"{DASHBOARD_TAB_TITLES[tab_name]} server running on {app_url}")
+        server.io_loop.start()
+    except KeyboardInterrupt:
+        startup_queue.put({
+            "status": "stopped",
+            "tab": tab_name,
+        })
+    except Exception as err:
+        startup_queue.put({
+            "status": "error",
+            "tab": tab_name,
+            "error": str(err),
+        })
+        print(f"Error starting {DASHBOARD_TAB_TITLES.get(tab_name, tab_name)} server: {err}")
+    finally:
+        if idle_callback is not None:
+            idle_callback.stop()
+        if server is not None:
+            server.stop()
+
+
+def _launch_multiwindow_dashboard(case_recorder_filename, callback_period,
+                                  pid_of_calling_script, script, meta_file,
+                                  hist_file, open_browser, host, selected_tabs,
+                                  core_assignments, base_port, idle_shutdown_seconds,
+                                  highlight_jacobian_structure, dark_mode):
+    context = multiprocessing.get_context('spawn')
+    startup_queue = context.Queue()
+    processes = {}
+
+    try:
+        for tab_name in selected_tabs:
+            proc = context.Process(
+                target=_serve_dashboard_tab_process,
+                args=(
+                    startup_queue,
+                    tab_name,
+                    core_assignments.get(tab_name),
+                    case_recorder_filename,
+                    callback_period,
+                    pid_of_calling_script,
+                    script,
+                    meta_file,
+                    hist_file,
+                    host,
+                    _port_for_dashboard_tab(tab_name, base_port),
+                    idle_shutdown_seconds,
+                    highlight_jacobian_structure,
+                    dark_mode,
+                ),
+            )
+            proc.start()
+            processes[tab_name] = proc
+
+        urls = {}
+        pending = set(selected_tabs)
+        deadline = time.time() + _MULTIWINDOW_STARTUP_TIMEOUT
+        while pending and time.time() < deadline:
+            try:
+                message = startup_queue.get(timeout=0.5)
+            except queue.Empty:
+                for tab_name in list(pending):
+                    proc = processes[tab_name]
+                    if not proc.is_alive():
+                        pending.remove(tab_name)
+                continue
+
+            tab_name = message.get("tab")
+            if tab_name not in pending:
+                continue
+            if message.get("status") == "started":
+                urls[tab_name] = message["url"]
+                pending.remove(tab_name)
+            else:
+                pending.remove(tab_name)
+                error = message.get("error")
+                if error:
+                    print(f"{DASHBOARD_TAB_TITLES.get(tab_name, tab_name)} failed to start: {error}")
+
+        if not urls:
+            raise RuntimeError("Failed to start any multiwindow dashboard tabs.")
+
+        for tab_name in selected_tabs:
+            if tab_name in urls:
+                print(f"{DASHBOARD_TAB_TITLES[tab_name]} URL: {urls[tab_name]}")
+
+        if open_browser:
+            for tab_name in selected_tabs:
+                if tab_name in urls:
+                    webbrowser.open_new_tab(urls[tab_name])
+        else:
+            print("Open the URLs above manually in your browser.")
+
+        while True:
+            alive = False
+            for proc in processes.values():
+                proc.join(timeout=0.5)
+                alive = alive or proc.is_alive()
+            if not alive:
+                break
+    except KeyboardInterrupt:
+        print("Stopping multiwindow dashboard processes")
+    finally:
+        for proc in processes.values():
+            if proc.is_alive():
+                proc.terminate()
+        for proc in processes.values():
+            proc.join(timeout=1.0)
+
+
 def realtime_plot(case_recorder_filename, callback_period,
                   pid_of_calling_script, script, meta_file=None, hist_file=None,
-                  open_browser=False, host='127.0.0.1'):
+                  open_browser=False, host='127.0.0.1',
+                  dashboard_mode=_DASHBOARD_MODE_TABBED, tabs_value=None,
+                  tab_core_value=None, base_port=_DEFAULT_MULTIWINDOW_BASE_PORT,
+                  idle_shutdown_seconds=_CHILD_IDLE_SHUTDOWN_SECONDS,
+                  highlight_jacobian_structure=_DEFAULT_HIGHLIGHT_JACOBIAN_STRUCTURE,
+                  dark_mode=_DEFAULT_DARK_MODE):
     """
     Visualize the objectives, desvars, and constraints during an optimization or analysis process.
 
@@ -441,25 +1012,63 @@ def realtime_plot(case_recorder_filename, callback_period,
         If not None, the file path of the script that created the case recorder file.
     """
     server = None
+    case_tracker = _CaseRecorderTracker(case_recorder_filename)
+    case_tracker.set_source_process_pid(pid_of_calling_script)
+    is_optimizer = case_tracker.is_driver_optimizer()
+
+    try:
+        selected_tabs, core_assignments = _resolve_dashboard_launch_config(
+            case_tracker,
+            dashboard_mode,
+            tabs_value,
+            tab_core_value,
+        )
+    except ValueError as err:
+        raise RuntimeError(str(err)) from err
+
+    if dashboard_mode == _DASHBOARD_MODE_MULTIWINDOW:
+        _launch_multiwindow_dashboard(
+            case_recorder_filename,
+            callback_period,
+            pid_of_calling_script,
+            script,
+            meta_file,
+            hist_file,
+            open_browser,
+            host,
+            selected_tabs,
+            core_assignments,
+            base_port,
+            idle_shutdown_seconds,
+            highlight_jacobian_structure,
+            dark_mode,
+        )
+        return
 
     def _make_realtime_plot_doc(doc):
         print(f"Creating realtime plot document for {case_recorder_filename}")
-        case_tracker = _CaseRecorderTracker(case_recorder_filename)
-        case_tracker.set_source_process_pid(pid_of_calling_script)
+        _set_dashboard_dark_mode_enabled(dark_mode)
+        _set_optimizer_dark_mode_enabled(dark_mode)
+        _apply_dark_theme(doc, enabled=dark_mode)
         metadata = load_rtplot_metadata(meta_file=meta_file, case_recorder_filename=case_recorder_filename)
-        if case_tracker.is_driver_optimizer():
+        if is_optimizer:
+            local_case_tracker = _CaseRecorderTracker(case_recorder_filename)
+            local_case_tracker.set_source_process_pid(pid_of_calling_script)
             _RealTimeDymosDashboard(
-                case_tracker,
+                local_case_tracker,
                 callback_period,
                 doc=doc,
                 pid_of_calling_script=pid_of_calling_script,
                 script=script,
                 metadata=metadata,
                 hist_file=hist_file,
+                highlight_jacobian_structure=highlight_jacobian_structure,
             )
         else:
+            local_case_tracker = _CaseRecorderTracker(case_recorder_filename)
+            local_case_tracker.set_source_process_pid(pid_of_calling_script)
             _RealTimeAnalysisDriverPlot(
-                case_tracker,
+                local_case_tracker,
                 callback_period,
                 doc=doc,
                 pid_of_calling_script=pid_of_calling_script,

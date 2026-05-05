@@ -8,12 +8,14 @@ import numbers
 import numpy as np
 from openmdao.core.constants import INF_BOUND
 from openmdao.utils.shell_proc import _is_process_running
+from scipy.linalg import qr
 
 from dymos_rtplot.realtime_plot.realtime_broker import LiveDataBroker
 from dymos_rtplot.realtime_plot.realtime_optimizer_plot import _RealTimeOptimizerPlot
 
 from bokeh.layouts import column, gridplot, row
 from bokeh.models import (
+    BoxAnnotation,
     CheckboxGroup,
     ColumnDataSource,
     Div,
@@ -34,6 +36,86 @@ _HEAVY_TAB_STRIDE = 5
 _ZERO_JAC_THRESHOLD = 1.0e-16
 _DEFAULT_LINE_COLORS = Category20[20]
 _PHASE_COLORS = Category10[10]
+_DARK_BG = "#0b1220"
+_DARK_PANEL = "#111827"
+_DARK_BORDER = "#334155"
+_DARK_TEXT = "#e5edf7"
+_DARK_MUTED = "#9fb0c7"
+_DARK_MODE_ENABLED = True
+CASE_PLOTTER_TAB = "case-plotter"
+TRAJECTORY_TAB = "trajectory"
+SERIES_TAB = "series"
+JACOBIAN_ENTRIES_TAB = "jacobian-entries"
+JACOBIAN_HEATMAP_TAB = "jacobian-heatmap"
+DASHBOARD_TAB_ORDER = (
+    CASE_PLOTTER_TAB,
+    TRAJECTORY_TAB,
+    SERIES_TAB,
+    JACOBIAN_ENTRIES_TAB,
+    JACOBIAN_HEATMAP_TAB,
+)
+DASHBOARD_TAB_TITLES = {
+    CASE_PLOTTER_TAB: "Case Plotter",
+    TRAJECTORY_TAB: "Trajectory",
+    SERIES_TAB: "Scaled + Opt",
+    JACOBIAN_ENTRIES_TAB: "Jacobian Entries",
+    JACOBIAN_HEATMAP_TAB: "Jacobian Heatmap",
+}
+_HEAVY_TABS = {JACOBIAN_ENTRIES_TAB, JACOBIAN_HEATMAP_TAB}
+
+
+def get_dashboard_tab_names():
+    return list(DASHBOARD_TAB_ORDER)
+
+
+def _ensure_figure_legend(fig):
+    if not fig.legend:
+        return
+    legend = fig.legend[0]
+    legend.visible = True
+    legend.location = "top_left"
+    legend.click_policy = "hide"
+
+
+def _set_dark_mode_enabled(enabled):
+    global _DARK_MODE_ENABLED
+    _DARK_MODE_ENABLED = bool(enabled)
+
+
+def _styled_div(text=""):
+    styles = {"color": _DARK_TEXT} if _DARK_MODE_ENABLED else {}
+    return Div(text=text, styles=styles)
+
+
+def _container_styles():
+    if not _DARK_MODE_ENABLED:
+        return {}
+    return {"background-color": _DARK_BG, "color": _DARK_TEXT}
+
+
+def _panel_styles():
+    if not _DARK_MODE_ENABLED:
+        return {}
+    return {
+        "background-color": _DARK_PANEL,
+        "border": f"1px solid {_DARK_BORDER}",
+        "color": _DARK_TEXT,
+    }
+
+
+def _style_figure(fig):
+    if not _DARK_MODE_ENABLED:
+        return
+    fig.background_fill_color = _DARK_BG
+    fig.border_fill_color = _DARK_BG
+    fig.outline_line_color = _DARK_BORDER
+    fig.xaxis.major_label_text_color = _DARK_TEXT
+    fig.yaxis.major_label_text_color = _DARK_TEXT
+    fig.xaxis.axis_label_text_color = _DARK_TEXT
+    fig.yaxis.axis_label_text_color = _DARK_TEXT
+    fig.title.text_color = _DARK_TEXT
+    fig.xgrid.grid_line_color = "#223046"
+    fig.ygrid.grid_line_color = "#223046"
 
 
 def _flatten(arr):
@@ -84,11 +166,115 @@ def _constraint_violation(values, lower=None, upper=None, equals=None):
     return violation
 
 
+def _collapse_repeated_samples(xvals, yvals, violation=None, atol=1.0e-10, rtol=1.0e-10):
+    x = np.asarray(xvals, dtype=float)
+    y = np.asarray(yvals, dtype=float)
+    if y.ndim > 1:
+        y = np.asarray(y)
+
+    if violation is None:
+        violation_arr = None
+    else:
+        violation_arr = np.asarray(violation, dtype=bool).reshape(-1)
+
+    common_len = x.shape[0]
+    if y.shape[0] != common_len:
+        common_len = min(common_len, y.shape[0])
+    if violation_arr is not None and violation_arr.shape[0] != common_len:
+        common_len = min(common_len, violation_arr.shape[0])
+
+    x = x[:common_len]
+    y = y[:common_len]
+    if violation_arr is not None:
+        violation_arr = violation_arr[:common_len]
+
+    if x.size <= 1:
+        if violation_arr is None:
+            return x, y, None
+        return x, y, violation_arr
+
+    keep = np.ones(x.shape[0], dtype=bool)
+
+    for idx in range(1, x.shape[0]):
+        if x[idx] != x[idx - 1]:
+            continue
+        if np.allclose(y[idx], y[idx - 1], atol=atol, rtol=rtol):
+            keep[idx] = False
+            if violation_arr is not None:
+                violation_arr[idx - 1] = violation_arr[idx - 1] or violation_arr[idx]
+
+    if violation_arr is None:
+        return x[keep], y[keep], None
+    return x[keep], y[keep], violation_arr[keep]
+
+
+def _matrix_rank_and_condition(matrix):
+    arr = np.asarray(matrix, dtype=float)
+    if arr.size == 0:
+        return 0, float("nan")
+    try:
+        singular_values = np.linalg.svd(arr, compute_uv=False)
+    except np.linalg.LinAlgError:
+        return int(np.linalg.matrix_rank(arr)), float("nan")
+    if singular_values.size == 0:
+        return 0, float("nan")
+    rank_tol = np.max(arr.shape) * np.finfo(float).eps * singular_values[0]
+    rank = int(np.sum(singular_values > rank_tol))
+    smallest = singular_values[-1]
+    if smallest <= rank_tol:
+        return rank, float("inf")
+    return rank, float(singular_values[0] / smallest)
+
+
+def _dependent_indices(matrix, axis, tol=_ZERO_JAC_THRESHOLD):
+    arr = np.asarray(matrix, dtype=float)
+    if arr.size == 0:
+        return []
+    work = arr if axis == "columns" else arr.T
+    if work.size == 0:
+        return []
+    try:
+        _, rmat, pivots = qr(work, mode="economic", pivoting=True)
+    except Exception:
+        return []
+    diag = np.abs(np.diag(rmat))
+    if diag.size == 0:
+        return list(sorted(int(idx) for idx in pivots))
+    dep_tol = max(tol, diag[0] * max(work.shape) * np.finfo(float).eps)
+    rank = int(np.sum(diag > dep_tol))
+    return list(sorted(int(idx) for idx in pivots[rank:]))
+
+
+def _format_suspicious_labels(labels, limit=6):
+    if not labels:
+        return "none"
+    shown = list(labels[:limit])
+    if len(labels) > limit:
+        shown.append(f"... +{len(labels) - limit} more")
+    return ", ".join(shown)
+
+
+def _normalize_trace_arrays(xvals, yvals, violation=None):
+    x = np.asarray(xvals, dtype=float).reshape(-1)
+    y = np.asarray(yvals, dtype=float).reshape(-1)
+    common_len = min(len(x), len(y))
+    violation_arr = None
+    if violation is not None:
+        violation_arr = np.asarray(violation, dtype=bool).reshape(-1)
+        common_len = min(common_len, len(violation_arr))
+    x = x[:common_len]
+    y = y[:common_len]
+    if violation_arr is None:
+        return x, y, np.zeros(common_len, dtype=bool)
+    return x, y, violation_arr[:common_len]
+
+
 class _TrajectoryTab:
     _CATEGORY_LABELS = {
         "controls": "Controls",
         "states": "States",
         "ode": "ODE Values",
+        "defects": "Defect Constraints",
         "state_rates": "State Rates",
         "control_rates": "Control Rates",
     }
@@ -100,8 +286,8 @@ class _TrajectoryTab:
         self._phase_paths = {}
         self._phase_meta = {}
         self._last_order = None
-        self._status = Div(text="Waiting for trajectory data...")
-        self._warning = Div(text="")
+        self._status = _styled_div("Waiting for trajectory data...")
+        self._warning = _styled_div("")
         self._traj_select = Select(title="Trajectory", options=[], value=None)
         self._order_selects = []
         self._plot_sources = {}
@@ -110,8 +296,16 @@ class _TrajectoryTab:
         self._plot_figures = {}
         self._plot_node_renderers = {}
         self._plot_violation_renderers = {}
-        self._plots_column = column(Div(text="Waiting for trajectory plots..."), sizing_mode="stretch_width")
-        self._plots_scroll = ScrollBox(child=self._plots_column, height_policy="max")
+        self._plots_column = column(
+            _styled_div("Waiting for trajectory plots..."),
+            sizing_mode="stretch_width",
+            styles=_container_styles(),
+        )
+        self._plots_scroll = ScrollBox(
+            child=self._plots_column,
+            height_policy="max",
+            styles=_container_styles(),
+        )
         self._display_check = CheckboxGroup(
             labels=["Show node markers", "Show violation markers"],
             active=[0, 1],
@@ -119,7 +313,7 @@ class _TrajectoryTab:
 
         order_controls = []
         category_options = [(key, label) for key, label in self._CATEGORY_LABELS.items()]
-        default_order = ["controls", "states", "ode", "state_rates", "control_rates"]
+        default_order = ["controls", "states", "ode", "defects", "state_rates", "control_rates"]
         for idx, category in enumerate(default_order, start=1):
             select = Select(title=f"Order {idx}", options=category_options, value=category, width=180)
             select.on_change("value", self._selection_changed)
@@ -128,10 +322,23 @@ class _TrajectoryTab:
 
         self._traj_select.on_change("value", self._selection_changed)
         self._display_check.on_change("active", self._selection_changed)
-        controls = row(self._traj_select, *order_controls, self._display_check, sizing_mode="stretch_width")
+        controls = row(
+            self._traj_select,
+            *order_controls,
+            self._display_check,
+            sizing_mode="stretch_width",
+            styles=_container_styles(),
+        )
         self.panel = TabPanel(
-            child=column(self._status, self._warning, controls, self._plots_scroll, sizing_mode="stretch_both"),
-            title="Trajectory",
+            child=column(
+                self._status,
+                self._warning,
+                controls,
+                self._plots_scroll,
+                sizing_mode="stretch_both",
+                styles=_container_styles(),
+            ),
+            title=DASHBOARD_TAB_TITLES[TRAJECTORY_TAB],
         )
 
     def _ensure_initialized(self):
@@ -184,6 +391,8 @@ class _TrajectoryTab:
                 for name, meta in phase_meta.get("timeseries_outputs", {}).items():
                     if meta.get("category") == "ode":
                         found.add(name)
+            elif category == "defects":
+                found.update(phase_meta.get("defect_outputs", {}).keys())
         return sorted(found)
 
     def _plot_key(self, category, variable):
@@ -202,6 +411,7 @@ class _TrajectoryTab:
             y_axis_label=variable,
             output_backend="webgl",
         )
+        _style_figure(fig)
         line_renderer = fig.multi_line(xs="xs", ys="ys", source=source, line_width=3, line_color="segment_color")
         node_renderer = fig.scatter("x", "y", source=node_source, size=6, color="node_color", alpha=0.95, line_color="black")
         viol_renderer = fig.scatter("x", "y", source=viol_source, size=8, color="red")
@@ -224,7 +434,7 @@ class _TrajectoryTab:
             return
 
         ordered_categories = self._selected_order()
-        if ordered_categories == self._last_order and self._plots_column.children and not isinstance(self._plots_column.children[0], Div):
+        if ordered_categories == self._last_order and self._plots_column.children:
             return
 
         children = []
@@ -232,22 +442,22 @@ class _TrajectoryTab:
             variables = self._category_variables(traj_meta, category)
             if not variables:
                 continue
-            children.append(Div(text=f"<b>{self._CATEGORY_LABELS[category]}</b>"))
+            children.append(_styled_div(f"<b>{self._CATEGORY_LABELS[category]}</b>"))
             figures = []
             for variable in variables:
                 key = self._plot_key(category, variable)
                 if key not in self._plot_figures:
                     self._make_plot(category, variable)
                 figures.append(self._plot_figures[key])
-            children.append(
-                gridplot(
-                    figures,
-                    ncols=3,
-                    sizing_mode="stretch_width",
-                    merge_tools=False,
-                    toolbar_location=None,
-                )
+            grid = gridplot(
+                figures,
+                ncols=3,
+                sizing_mode="stretch_width",
+                merge_tools=False,
+                toolbar_location=None,
             )
+            grid.styles = _container_styles()
+            children.append(grid)
         self._plots_column.children = children
         self._last_order = ordered_categories
 
@@ -295,6 +505,7 @@ class _TrajectoryTab:
                         banner_parts.append(warning)
                     if xvals is None:
                         continue
+                    xvals, yvals, violation_mask = _normalize_trace_arrays(xvals, yvals, violation_mask)
 
                     phase_name = phase_meta["name"]
                     traces_x.append(xvals.tolist())
@@ -333,6 +544,8 @@ class _TrajectoryTab:
             return self._control_trace(case, phase_meta, variable)
         if category == "control_rates":
             return self._control_trace(case, phase_meta, variable, derivative_order=1)
+        if category == "defects":
+            return self._defect_trace(case, phase_meta, variable)
         return self._ode_trace(case, phase_meta, variable)
 
     def _physical_time(self, case, phase_meta):
@@ -428,6 +641,7 @@ class _TrajectoryTab:
         dense_val = np.reshape(dense_val, (dense_val.shape[0],) + shape)
         yvals = dense_val[:, 0] if dense_val.ndim > 1 else dense_val
         violation = self._bounds_violation(yvals[:, np.newaxis], state_meta)
+        dense_x, yvals, violation = _collapse_repeated_samples(dense_x, yvals, violation)
         return dense_x, np.asarray(yvals, dtype=float), violation, None
 
     def _control_trace(self, case, phase_meta, variable, derivative_order=0):
@@ -465,6 +679,7 @@ class _TrajectoryTab:
         dense_val = np.reshape(dense_val, (dense_val.shape[0],) + shape)
         yvals = dense_val[:, 0] if dense_val.ndim > 1 else dense_val
         violation = self._bounds_violation(yvals[:, np.newaxis], phase_meta["controls"][variable])
+        dense_x, yvals, violation = _collapse_repeated_samples(dense_x, yvals, violation)
         return dense_x, np.asarray(yvals, dtype=float), violation, None
 
     def _ode_trace(self, case, phase_meta, variable):
@@ -472,6 +687,12 @@ class _TrajectoryTab:
         if not meta:
             return None, None, np.array([], dtype=bool), None
         return self._timeseries_trace(case, phase_meta, meta["path"], boundary_state=meta)
+
+    def _defect_trace(self, case, phase_meta, variable):
+        meta = phase_meta.get("defect_outputs", {}).get(variable)
+        if not meta:
+            return None, None, np.array([], dtype=bool), None
+        return self._defect_output_trace(case, phase_meta, meta["path"], meta.get("node_ptau"))
 
     def _timeseries_trace(self, case, phase_meta, relative_path, boundary_state=None, warning=None):
         phase_path = phase_meta["promoted_path"]
@@ -488,13 +709,14 @@ class _TrajectoryTab:
         constraint_violation = self._constraint_violation_for_path(case, phase_meta, path)
         if constraint_violation is not None and len(constraint_violation) == len(violation):
             violation |= constraint_violation
+        xvals, yvals, violation = _collapse_repeated_samples(xvals, yvals, violation)
         return xvals, np.asarray(yvals, dtype=float), violation, warning
 
     def _phase_marker_trace(self, case, phase_meta, category, variable):
         if category == "states":
-            return self._marker_trace(case, phase_meta, f"timeseries.states:{variable}")
+            return self._state_marker_trace(case, phase_meta, variable)
         if category == "controls":
-            return self._marker_trace(case, phase_meta, f"timeseries.controls:{variable}")
+            return self._control_marker_trace(case, phase_meta, variable)
         if category == "state_rates":
             meta = phase_meta.get("timeseries_outputs", {}).get(f"state_rates:{variable}")
             if meta:
@@ -512,7 +734,75 @@ class _TrajectoryTab:
         meta = phase_meta.get("timeseries_outputs", {}).get(variable)
         if meta:
             return self._marker_trace(case, phase_meta, meta["path"])
+        if category == "defects":
+            meta = phase_meta.get("defect_outputs", {}).get(variable)
+            if meta:
+                return self._defect_marker_trace(case, phase_meta, meta["path"], meta.get("node_ptau"))
         return None, None
+
+    def _defect_output_trace(self, case, phase_meta, path, node_ptau):
+        try:
+            yraw = np.asarray(case.get_val(path))
+        except Exception:
+            return None, None, np.array([], dtype=bool), None
+        xvals = self._defect_xvals(case, phase_meta, yraw.shape[0], node_ptau)
+        yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, violation = _collapse_repeated_samples(xvals, yvals, np.zeros(len(np.asarray(xvals).reshape(-1)), dtype=bool))
+        return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float), violation, None
+
+    def _defect_marker_trace(self, case, phase_meta, path, node_ptau):
+        try:
+            yraw = np.asarray(case.get_val(path))
+        except Exception:
+            return None, None
+        xvals = self._defect_xvals(case, phase_meta, yraw.shape[0], node_ptau)
+        yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, _ = _collapse_repeated_samples(xvals, yvals)
+        return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float)
+
+    def _defect_xvals(self, case, phase_meta, count, node_ptau):
+        if node_ptau:
+            xvals = self._phase_time_from_ptau(case, phase_meta, node_ptau)
+            return np.asarray(xvals, dtype=float)
+        return self._timeseries_xvals(case, phase_meta, count)
+
+    def _phase_time_from_ptau(self, case, phase_meta, node_ptau):
+        t_initial = self._phase_initial_time(case, phase_meta)
+        t_duration = _scalar_item(case.get_val(f"{phase_meta['promoted_path']}.t_duration"))
+        ptau = np.asarray(node_ptau, dtype=float)
+        return t_initial + 0.5 * (ptau + 1.0) * t_duration
+
+    def _state_marker_trace(self, case, phase_meta, variable):
+        phase_path = phase_meta["promoted_path"]
+        try:
+            yraw = np.asarray(case.get_val(f"{phase_path}.states:{variable}"))
+        except Exception:
+            return None, None
+
+        node_ptau = phase_meta.get("state_input_node_ptau")
+        if node_ptau is None:
+            return self._marker_trace(case, phase_meta, f"timeseries.states:{variable}")
+
+        xvals = self._phase_time_from_ptau(case, phase_meta, node_ptau)
+        yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, _ = _collapse_repeated_samples(xvals, yvals)
+        return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float)
+
+    def _control_marker_trace(self, case, phase_meta, variable):
+        phase_path = phase_meta["promoted_path"]
+        try:
+            yraw = np.asarray(case.get_val(f"{phase_path}.controls:{variable}"))
+        except Exception:
+            return None, None
+
+        node_ptau = phase_meta.get("control_input_node_ptau")
+        if node_ptau is None:
+            return self._marker_trace(case, phase_meta, f"timeseries.controls:{variable}")
+
+        xvals = self._phase_time_from_ptau(case, phase_meta, node_ptau)
+        yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, _ = _collapse_repeated_samples(xvals, yvals)
+        return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float)
 
     def _marker_trace(self, case, phase_meta, relative_path):
         phase_path = phase_meta["promoted_path"]
@@ -523,6 +813,7 @@ class _TrajectoryTab:
             return None, None
         xvals = self._timeseries_xvals(case, phase_meta, yraw.shape[0])
         yvals = yraw[:, 0] if yraw.ndim > 1 else yraw
+        xvals, yvals, _ = _collapse_repeated_samples(xvals, yvals)
         return np.asarray(xvals, dtype=float), np.asarray(yvals, dtype=float)
 
     def _timeseries_xvals(self, case, phase_meta, count):
@@ -581,7 +872,7 @@ class _SeriesTab:
         self._broker = broker
         self._updating_widgets = False
         self._source = ColumnDataSource(data=dict(iteration=[]))
-        self._warning = Div(text="")
+        self._warning = _styled_div("")
         self._group_select = Select(
             title="Group",
             options=list(self._GROUP_LABEL_TO_KEY.keys()),
@@ -595,13 +886,17 @@ class _SeriesTab:
             y_axis_label="Value",
             output_backend="webgl",
         )
+        _style_figure(self._figure)
         placeholder = ColumnDataSource(data=dict(x=[], y=[]))
         self._figure.line("x", "y", source=placeholder, visible=False)
         self._renderers = {}
         self._group_select.on_change("value", self._selection_changed)
         self._var_select.on_change("value", self._selection_changed)
-        controls = row(self._group_select, self._var_select, sizing_mode="stretch_width")
-        self.panel = TabPanel(child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"), title="Scaled + Opt")
+        controls = row(self._group_select, self._var_select, sizing_mode="stretch_width", styles=_container_styles())
+        self.panel = TabPanel(
+            child=column(self._warning, controls, self._figure, sizing_mode="stretch_both", styles=_container_styles()),
+            title=DASHBOARD_TAB_TITLES[SERIES_TAB],
+        )
 
     def _selection_changed(self, attr, old, new):
         if self._updating_widgets:
@@ -644,12 +939,38 @@ class _SeriesTab:
                 renderer.visible = False
             self._source.data = dict(iteration=[])
             return
-        iterations = [snapshot.major_iteration for snapshot in self._broker.snapshots]
-        data = {"iteration": iterations}
         group_key = self._GROUP_LABEL_TO_KEY.get(self._group_select.value, "scaled_objs")
-        for name in selected:
-            series = self._broker.get_series(group_key, name)
-            data[name] = [_scalar_for_plot(item) for item in series]
+        if group_key == "opt_history":
+            history_entries = self._broker.get_history_entries()
+            iterations = []
+            data = {"iteration": iterations}
+            for idx, entry in enumerate(history_entries, start=1):
+                iter_value = entry.get("iter", idx)
+                iterations.append(_scalar_item(iter_value) if np.asarray(iter_value).size else float(idx))
+            for name in selected:
+                values = []
+                for entry in history_entries:
+                    if name not in entry:
+                        continue
+                    values.append(_scalar_for_plot(entry[name]))
+                data[name] = values
+            warning = self._broker.get_history_warning()
+            if not self._broker.get_history_keys():
+                warning = "No pyOptSparse .hst file available, so optimizer diagnostics are unavailable."
+            elif len(self._broker.snapshots) != len(history_entries):
+                warning = (
+                    "Optimizer history is plotted on its own iteration axis because its row count "
+                    "diverged from OpenMDAO driver cases."
+                )
+            self._warning.text = warning or ""
+        else:
+            iterations = [snapshot.major_iteration for snapshot in self._broker.snapshots]
+            data = {"iteration": iterations}
+            for name in selected:
+                series = self._broker.get_series(group_key, name)
+                data[name] = [_scalar_for_plot(item) for item in series]
+            warning = self._broker.get_history_warning()
+            self._warning.text = warning or ""
         self._source.data = data
         existing = set(self._renderers)
         for idx, name in enumerate(selected):
@@ -667,11 +988,7 @@ class _SeriesTab:
             self._renderers[name].visible = True
         for name in existing - set(selected):
             self._renderers[name].visible = False
-        self._figure.legend.click_policy = "hide"
-        warning = self._broker.get_history_warning()
-        if group_key == "opt_history" and not self._broker.get_history_keys():
-            warning = "No pyOptSparse .hst file available, so optimizer diagnostics are unavailable."
-        self._warning.text = warning or ""
+        _ensure_figure_legend(self._figure)
 
 
 class _JacobianEntriesTab:
@@ -692,13 +1009,23 @@ class _JacobianEntriesTab:
             y_axis_label="Derivative",
             output_backend="webgl",
         )
+        _style_figure(self._figure)
         placeholder = ColumnDataSource(data=dict(x=[], y=[]))
         self._figure.line("x", "y", source=placeholder, visible=False)
         self._block_select.on_change("value", self._block_changed)
         self._entry_select.on_change("value", self._entry_changed)
         self._log_check.on_change("active", self._log_changed)
-        controls = row(self._block_select, self._entry_select, self._log_check, sizing_mode="stretch_width")
-        self.panel = TabPanel(child=column(self._warning, controls, self._figure, sizing_mode="stretch_both"), title="Jacobian Entries")
+        controls = row(
+            self._block_select,
+            self._entry_select,
+            self._log_check,
+            sizing_mode="stretch_width",
+            styles=_container_styles(),
+        )
+        self.panel = TabPanel(
+            child=column(self._warning, controls, self._figure, sizing_mode="stretch_both", styles=_container_styles()),
+            title=DASHBOARD_TAB_TITLES[JACOBIAN_ENTRIES_TAB],
+        )
 
     def _block_changed(self, attr, old, new):
         if self._updating_widgets:
@@ -722,10 +1049,10 @@ class _JacobianEntriesTab:
         self.refresh(force=True)
 
     def _latest_derivatives(self):
-        snapshot = self._broker.latest_snapshot()
-        if snapshot is None:
-            return None
-        return snapshot.derivatives
+        for snapshot in reversed(self._broker.snapshots):
+            if snapshot.derivatives is not None:
+                return snapshot.derivatives
+        return None
 
     def refresh(self, force=False):
         if not self._broker.snapshots:
@@ -825,16 +1152,17 @@ class _JacobianEntriesTab:
             for renderer in self._renderers.values():
                 renderer.visible = False
             return
-        data = {"iteration": [snapshot.major_iteration for snapshot in self._broker.snapshots]}
+        derivative_snapshots = [
+            snapshot for snapshot in self._broker.snapshots
+            if snapshot.derivatives is not None and block_key in snapshot.derivatives
+        ]
+        data = {"iteration": [snapshot.major_iteration for snapshot in derivative_snapshots]}
         use_log = 0 in self._log_check.active
         for label in selected:
             idx = ever_nonzero[label]
             values = []
-            for snapshot in self._broker.snapshots:
+            for snapshot in derivative_snapshots:
                 derivs = snapshot.derivatives
-                if derivs is None or block_key not in derivs:
-                    values.append(np.nan)
-                    continue
                 arr = np.asarray(derivs[block_key])
                 if arr.ndim == 1:
                     arr = arr[:, np.newaxis]
@@ -842,6 +1170,7 @@ class _JacobianEntriesTab:
                 values.append(math.log10(abs(value)) if use_log and abs(value) > 0.0 else value)
             data[label] = values
         self._source.data = data
+        missing_count = len(self._broker.snapshots) - len(derivative_snapshots)
 
         existing = set(self._renderers)
         for idx, label in enumerate(selected):
@@ -859,14 +1188,22 @@ class _JacobianEntriesTab:
             self._renderers[label].visible = True
         for label in existing - set(selected):
             self._renderers[label].visible = False
-        self._warning.text = ""
+        _ensure_figure_legend(self._figure)
+        if missing_count > 0:
+            self._warning.text = (
+                f"Showing {len(derivative_snapshots)} iterations with recorded derivatives; "
+                f"{missing_count} driver iterations had no derivative block for this view."
+            )
+        else:
+            self._warning.text = ""
 
 
 class _JacobianHeatmapTab:
-    def __init__(self, broker):
+    def __init__(self, broker, highlight_structure=True):
         self._broker = broker
-        self._warning = Div(text="")
-        self._stats = Div(text="Waiting for derivatives...")
+        self._highlight_structure = highlight_structure
+        self._warning = _styled_div("")
+        self._stats = _styled_div("Waiting for derivatives...")
         self._source = ColumnDataSource(data=dict(x=[], y=[], value=[], label=[]))
         self._mapper = LinearColorMapper(palette=RdBu11[::-1], low=-1.0, high=1.0)
         self._figure = figure(
@@ -877,8 +1214,22 @@ class _JacobianHeatmapTab:
             output_backend="webgl",
             tooltips=[("entry", "@label"), ("sym-log", "@value")],
         )
+        _style_figure(self._figure)
+        self._row_highlight_source = ColumnDataSource(data=dict(left=[], right=[], bottom=[], top=[], color=[], kind=[]))
+        self._col_highlight_source = ColumnDataSource(data=dict(left=[], right=[], bottom=[], top=[], color=[], kind=[]))
         self._figure.rect(x="x", y="y", width=1, height=1, source=self._source, fill_color={"field": "value", "transform": self._mapper}, line_color=None)
-        self.panel = TabPanel(child=column(self._warning, self._stats, self._figure, sizing_mode="stretch_both"), title="Jacobian Heatmap")
+        self._figure.quad(
+            left="left", right="right", bottom="bottom", top="top",
+            source=self._row_highlight_source, fill_color="color", fill_alpha=0.18, line_color=None
+        )
+        self._figure.quad(
+            left="left", right="right", bottom="bottom", top="top",
+            source=self._col_highlight_source, fill_color="color", fill_alpha=0.14, line_color=None
+        )
+        self.panel = TabPanel(
+            child=column(self._warning, self._stats, self._figure, sizing_mode="stretch_both", styles=_container_styles()),
+            title=DASHBOARD_TAB_TITLES[JACOBIAN_HEATMAP_TAB],
+        )
 
     def refresh(self, force=False):
         if not self._broker.snapshots:
@@ -904,20 +1255,34 @@ class _JacobianHeatmapTab:
         label = []
         row_cursor = 0
         row_map = {}
+        row_sizes = {}
         for of, wrt, block in blocks:
             row_start = row_map.setdefault(of, row_cursor)
             if row_start == row_cursor:
+                row_sizes[of] = block.shape[0]
                 row_cursor += block.shape[0]
         nrows = row_cursor
 
         col_cursor = 0
         col_map = {}
+        col_sizes = {}
         for of, wrt, block in blocks:
             col_start = col_map.setdefault(wrt, col_cursor)
             if col_start == col_cursor:
+                col_sizes[wrt] = block.shape[1]
                 col_cursor += block.shape[1]
         ncols = col_cursor
         dense = np.zeros((nrows, ncols))
+        row_labels = [None] * nrows
+        col_labels = [None] * ncols
+        for of, row_start in row_map.items():
+            size = row_sizes[of]
+            for idx in range(size):
+                row_labels[row_start + idx] = f"{of}[{idx}]"
+        for wrt, col_start in col_map.items():
+            size = col_sizes[wrt]
+            for idx in range(size):
+                col_labels[col_start + idx] = f"{wrt}[{idx}]"
 
         for of, wrt, block in blocks:
             row_start = row_map[of]
@@ -951,10 +1316,69 @@ class _JacobianHeatmapTab:
                 prev_dense[row_map[of]:row_map[of] + prev_block.shape[0], col_map[wrt]:col_map[wrt] + prev_block.shape[1]] = prev_block
             break
 
-        rank = int(np.linalg.matrix_rank(dense)) if dense.size else 0
-        cond = float(np.linalg.cond(dense)) if dense.size else float("nan")
+        rank, cond = _matrix_rank_and_condition(dense)
         nnz = int(np.count_nonzero(np.abs(dense) > _ZERO_JAC_THRESHOLD))
         density = nnz / dense.size if dense.size else 0.0
+        row_norms = np.linalg.norm(dense, axis=1) if dense.size else np.array([], dtype=float)
+        col_norms = np.linalg.norm(dense, axis=0) if dense.size else np.array([], dtype=float)
+        zero_row_idx = [idx for idx, norm in enumerate(row_norms) if norm <= _ZERO_JAC_THRESHOLD]
+        zero_col_idx = [idx for idx, norm in enumerate(col_norms) if norm <= _ZERO_JAC_THRESHOLD]
+        dep_row_idx = [idx for idx in _dependent_indices(dense, "rows") if idx not in zero_row_idx]
+        dep_col_idx = [idx for idx in _dependent_indices(dense, "columns") if idx not in zero_col_idx]
+        zero_row_labels = [row_labels[idx] for idx in zero_row_idx]
+        zero_col_labels = [col_labels[idx] for idx in zero_col_idx]
+        dep_row_labels = [row_labels[idx] for idx in dep_row_idx]
+        dep_col_labels = [col_labels[idx] for idx in dep_col_idx]
+        row_left = []
+        row_right = []
+        row_bottom = []
+        row_top = []
+        row_color = []
+        row_kind = []
+        for idx in zero_row_idx:
+            row_left.append(0.0)
+            row_right.append(float(ncols))
+            row_bottom.append(float(idx))
+            row_top.append(float(idx + 1))
+            row_color.append("#d62728")
+            row_kind.append("zero-row")
+        for idx in dep_row_idx:
+            row_left.append(0.0)
+            row_right.append(float(ncols))
+            row_bottom.append(float(idx))
+            row_top.append(float(idx + 1))
+            row_color.append("#ff7f0e")
+            row_kind.append("dependent-row")
+        col_left = []
+        col_right = []
+        col_bottom = []
+        col_top = []
+        col_color = []
+        col_kind = []
+        for idx in zero_col_idx:
+            col_left.append(float(idx))
+            col_right.append(float(idx + 1))
+            col_bottom.append(0.0)
+            col_top.append(float(nrows))
+            col_color.append("#9467bd")
+            col_kind.append("zero-col")
+        for idx in dep_col_idx:
+            col_left.append(float(idx))
+            col_right.append(float(idx + 1))
+            col_bottom.append(0.0)
+            col_top.append(float(nrows))
+            col_color.append("#17becf")
+            col_kind.append("dependent-col")
+        if self._highlight_structure:
+            self._row_highlight_source.data = dict(
+                left=row_left, right=row_right, bottom=row_bottom, top=row_top, color=row_color, kind=row_kind
+            )
+            self._col_highlight_source.data = dict(
+                left=col_left, right=col_right, bottom=col_bottom, top=col_top, color=col_color, kind=col_kind
+            )
+        else:
+            self._row_highlight_source.data = dict(left=[], right=[], bottom=[], top=[], color=[], kind=[])
+            self._col_highlight_source.data = dict(left=[], right=[], bottom=[], top=[], color=[], kind=[])
         if prev_dense is None:
             delta_norm = float("nan")
             max_delta = float("nan")
@@ -962,37 +1386,57 @@ class _JacobianHeatmapTab:
             delta = dense - prev_dense
             delta_norm = float(np.linalg.norm(delta))
             max_delta = float(np.max(np.abs(delta)))
+        cond_text = "inf" if math.isinf(cond) else f"{cond:.3e}"
         self._stats.text = (
             f"shape={dense.shape}, nnz={nnz}, density={density:.4f}, rank={rank}, "
-            f"cond={cond:.3e}, frob_delta={delta_norm:.3e}, max_abs_delta={max_delta:.3e}"
+            f"cond={cond_text}, frob_delta={delta_norm:.3e}, max_abs_delta={max_delta:.3e}"
         )
-        self._warning.text = ""
+        warning_parts = []
+        if math.isinf(cond):
+            warning_parts.append("Jacobian appears singular or numerically rank deficient; condition number is infinite.")
+        if zero_row_labels:
+            warning_parts.append(f"Zero rows: {_format_suspicious_labels(zero_row_labels)}")
+        if zero_col_labels:
+            warning_parts.append(f"Zero columns: {_format_suspicious_labels(zero_col_labels)}")
+        if dep_row_labels:
+            warning_parts.append(f"Dependent rows: {_format_suspicious_labels(dep_row_labels)}")
+        if dep_col_labels:
+            warning_parts.append(f"Dependent columns: {_format_suspicious_labels(dep_col_labels)}")
+        if not self._highlight_structure:
+            warning_parts.append("Jacobian structure highlighting is disabled.")
+        self._warning.text = " ".join(warning_parts)
 
 
 class _RealTimeDymosDashboard:
-    def __init__(self, case_tracker, callback_period, doc, pid_of_calling_script, script, metadata=None, hist_file=None):
-        self._broker = LiveDataBroker(case_tracker, metadata=metadata, hist_file=hist_file)
+    def __init__(self, case_tracker, callback_period, doc, pid_of_calling_script, script,
+                 metadata=None, hist_file=None, highlight_jacobian_structure=True):
+        recorder_filename = case_tracker.get_case_recorder_filename()
+        broker_tracker = type(case_tracker)(recorder_filename)
+        broker_tracker.set_source_process_pid(pid_of_calling_script)
+        plot_tracker = type(case_tracker)(recorder_filename)
+        plot_tracker.set_source_process_pid(pid_of_calling_script)
+        self._broker = LiveDataBroker(broker_tracker, metadata=metadata, hist_file=hist_file)
         self._doc = doc
         self._pid = pid_of_calling_script
         self._last_active = 0
-        self._tab4_rendered = False
-        self._tab5_rendered = False
-        self._optimizer_plot = _RealTimeOptimizerPlot(
-            case_tracker,
-            callback_period,
-            doc,
-            pid_of_calling_script,
-            script,
-            add_root=False,
-            start_callback=False,
-        )
-        self._tab1 = TabPanel(child=self._optimizer_plot.layout, title="Current RTPlot")
-        self._tab2 = _TrajectoryTab(self._broker)
-        self._tab3 = _SeriesTab(self._broker)
-        self._tab4 = _JacobianEntriesTab(self._broker)
-        self._tab5 = _JacobianHeatmapTab(self._broker)
+        self._tab_rendered = {name: False for name in _HEAVY_TABS}
+        self._tab_objects = {}
+        self._tab_panels = []
+        for tab_name in DASHBOARD_TAB_ORDER:
+            tab_obj, panel = _build_dashboard_tab(
+                tab_name,
+                plot_tracker if tab_name == CASE_PLOTTER_TAB else broker_tracker,
+                callback_period,
+                doc,
+                pid_of_calling_script,
+                script,
+                broker=self._broker,
+                highlight_jacobian_structure=highlight_jacobian_structure,
+            )
+            self._tab_objects[tab_name] = tab_obj
+            self._tab_panels.append(panel)
         self._tabs = Tabs(
-            tabs=[self._tab1, self._tab2.panel, self._tab3.panel, self._tab4.panel, self._tab5.panel],
+            tabs=self._tab_panels,
             sizing_mode="stretch_both",
         )
         self._tabs.on_change("active", self._active_tab_changed)
@@ -1001,34 +1445,105 @@ class _RealTimeDymosDashboard:
         self._doc.title = "Dymos RTPlot Dashboard"
 
     def _active_tab_changed(self, attr, old, new):
-        if new == 3 and self._broker.snapshots:
-            self._tab4.refresh(force=True)
-            self._tab4_rendered = True
-        elif new == 4 and self._broker.snapshots:
-            self._tab5.refresh(force=True)
-            self._tab5_rendered = True
+        if not self._broker.snapshots:
+            return
+        active_name = DASHBOARD_TAB_ORDER[new]
+        if active_name in _HEAVY_TABS:
+            self._tab_objects[active_name].refresh(force=True)
+            self._tab_rendered[active_name] = True
 
     def _update(self):
-        self._optimizer_plot._update_wrapped_in_try()
-        new_snapshots = self._broker.poll()
+        try:
+            self._tab_objects[CASE_PLOTTER_TAB]._update_wrapped_in_try()
+            new_snapshots = self._broker.poll()
+        except Exception as exc:
+            print(f"Dashboard update will retry after refresh error: {exc}")
+            return
         if not new_snapshots and not self._broker.is_running():
             return
         if not self._broker.snapshots:
             return
 
-        active = self._tabs.active
-        self._tab2.refresh()
-        self._tab3.refresh()
-        latest_iter = self._broker.latest_snapshot().major_iteration
-        active_changed = active != self._last_active
-        heavy_allowed = active in (3, 4) and (
-            active_changed or len(new_snapshots) > 0 or latest_iter % _HEAVY_TAB_STRIDE == 0
+        try:
+            active = self._tabs.active
+            self._tab_objects[TRAJECTORY_TAB].refresh()
+            self._tab_objects[SERIES_TAB].refresh()
+            latest_iter = self._broker.latest_snapshot().major_iteration
+            active_changed = active != self._last_active
+            active_name = DASHBOARD_TAB_ORDER[active]
+            heavy_allowed = active_name in _HEAVY_TABS and (
+                active_changed or len(new_snapshots) > 0 or latest_iter % _HEAVY_TAB_STRIDE == 0
+            )
+            if heavy_allowed:
+                self._tab_objects[active_name].refresh(force=True)
+                self._tab_rendered[active_name] = True
+            self._last_active = active
+        except Exception as exc:
+            print(f"Dashboard tab refresh will retry after refresh error: {exc}")
+            return
+
+
+def _build_dashboard_tab(tab_name, case_tracker, callback_period, doc, pid_of_calling_script,
+                         script, broker=None, highlight_jacobian_structure=True):
+    if tab_name == CASE_PLOTTER_TAB:
+        plot = _RealTimeOptimizerPlot(
+            case_tracker,
+            callback_period,
+            doc,
+            pid_of_calling_script,
+            script,
+            add_root=False,
+            start_callback=False,
         )
-        if heavy_allowed:
-            if active == 3:
-                self._tab4.refresh(force=True)
-                self._tab4_rendered = True
-            elif active == 4:
-                self._tab5.refresh(force=True)
-                self._tab5_rendered = True
-        self._last_active = active
+        return plot, TabPanel(child=plot.layout, title=DASHBOARD_TAB_TITLES[CASE_PLOTTER_TAB])
+
+    if broker is None:
+        raise ValueError("A broker is required for non-case-plotter dashboard tabs.")
+    if tab_name == TRAJECTORY_TAB:
+        tab = _TrajectoryTab(broker)
+    elif tab_name == SERIES_TAB:
+        tab = _SeriesTab(broker)
+    elif tab_name == JACOBIAN_ENTRIES_TAB:
+        tab = _JacobianEntriesTab(broker)
+    elif tab_name == JACOBIAN_HEATMAP_TAB:
+        tab = _JacobianHeatmapTab(broker, highlight_structure=highlight_jacobian_structure)
+    else:
+        raise KeyError(f"Unknown dashboard tab: {tab_name}")
+
+    return tab, tab.panel
+
+
+class _StandaloneDashboardTabApp:
+    def __init__(self, tab_name, case_tracker, callback_period, doc, pid_of_calling_script,
+                 script, metadata=None, hist_file=None, highlight_jacobian_structure=True):
+        self._tab_name = tab_name
+        self._broker = LiveDataBroker(case_tracker, metadata=metadata, hist_file=hist_file)
+        self._doc = doc
+        self._tab, panel = _build_dashboard_tab(
+            tab_name,
+            case_tracker,
+            callback_period,
+            doc,
+            pid_of_calling_script,
+            script,
+            broker=self._broker,
+            highlight_jacobian_structure=highlight_jacobian_structure,
+        )
+        self._doc.add_root(panel.child)
+        self._doc.add_periodic_callback(self._update, callback_period)
+        self._doc.title = f"Dymos RTPlot - {DASHBOARD_TAB_TITLES[tab_name]}"
+
+    def _update(self):
+        try:
+            new_snapshots = self._broker.poll()
+            if not new_snapshots and not self._broker.is_running():
+                return
+            if not self._broker.snapshots:
+                return
+            self._tab.refresh(force=self._tab_name in _HEAVY_TABS)
+        except Exception as exc:
+            print(
+                f"Standalone {DASHBOARD_TAB_TITLES[self._tab_name]} tab will retry "
+                f"after refresh error: {exc}"
+            )
+            return

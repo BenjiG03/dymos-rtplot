@@ -201,6 +201,45 @@ def _timeseries_output_meta(phase):
     return outputs
 
 
+def _defect_output_meta(phase):
+    outputs = {}
+    phase_path = _phase_promoted_path(phase)
+    transcription = phase.options['transcription']
+    grid_data = transcription.grid_data
+
+    collocation_ptau = (
+        grid_data.node_ptau[grid_data.subset_node_indices['col']].tolist()
+        if 'col' in grid_data.subset_node_indices else []
+    )
+    continuity_ptau = grid_data.segment_ends[1:-1].tolist()
+
+    for state_name in phase.state_options:
+        outputs[f"collocation:{state_name}"] = {
+            'path': f'{phase_path}.collocation_constraint.defects:{state_name}',
+            'kind': 'collocation',
+            'node_ptau': collocation_ptau,
+        }
+        outputs[f"continuity-state:{state_name}"] = {
+            'path': f'{phase_path}.continuity_comp.defect_states:{state_name}',
+            'kind': 'continuity-state',
+            'node_ptau': continuity_ptau,
+        }
+
+    for control_name in phase.control_options:
+        outputs[f"continuity-control:{control_name}"] = {
+            'path': f'{phase_path}.continuity_comp.defect_controls:{control_name}',
+            'kind': 'continuity-control',
+            'node_ptau': continuity_ptau,
+        }
+        outputs[f"continuity-control-rate:{control_name}_rate"] = {
+            'path': f'{phase_path}.continuity_comp.defect_control_rates:{control_name}_rate',
+            'kind': 'continuity-control-rate',
+            'node_ptau': continuity_ptau,
+        }
+
+    return outputs
+
+
 def _state_rate_metadata(phase, state_name):
     transcription = phase.options['transcription']
     try:
@@ -297,6 +336,13 @@ def build_rtplot_metadata(problem, case_recorder_filename):
                     'node_dptau_dstau': output_grid.node_dptau_dstau.tolist(),
                     'segment_indices': output_grid.segment_indices.tolist(),
                 },
+                'state_input_node_ptau': grid_data.node_ptau[
+                    grid_data.subset_node_indices['state_input']
+                ].tolist(),
+                'control_input_node_ptau': grid_data.node_ptau[
+                    grid_data.subset_node_indices['control_input']
+                ].tolist(),
+                'defect_outputs': _defect_output_meta(phase),
                 'states': {},
                 'controls': {},
                 'timeseries_outputs': _timeseries_output_meta(phase),
