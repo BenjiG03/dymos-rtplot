@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -33,7 +34,10 @@ def readonly_sqlite_connection(path, timeout=1.0):
     accidental writer locks and lets refresh callbacks fail quickly when a row is
     still being committed.
     """
-    db_uri = Path(path).resolve().as_uri().replace("file:///", "file:///") + "?mode=ro"
+    # Use os.path.abspath() instead of Path.resolve() to avoid Windows
+    # extended-length path prefix (\\?\) which as_uri() encodes as %3F,
+    # producing "file://%3F/C%3A/..." — an invalid URI that SQLite rejects.
+    db_uri = Path(os.path.abspath(str(path))).as_uri() + "?mode=ro"
     con = sqlite3.connect(db_uri, uri=True, timeout=timeout)
     try:
         yield con
@@ -143,9 +147,43 @@ class OptimizerHistoryAccess:
         with tempfile.NamedTemporaryFile(prefix="dymos_rtplot_", suffix=hist_path.suffix, delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
-            # pyOptSparse may have the live history file open for writing. Reading a
-            # best-effort copy prevents dashboard tabs from competing for that handle.
-            shutil.copy2(hist_path, tmp_path)
+            # Use SQLite's online backup API instead of shutil.copy2.
+            #
+            # pyOptSparse 2.x stores history as a SQLite database.  A plain
+            # shutil.copy2() of a live SQLite file can capture the main .db
+            # file in mid-commit without the companion -journal, producing a
+            # copy that raises "database disk image is malformed" when opened.
+            # This is especially likely with IPOPT, whose line-search writes a
+            # new row on every function evaluation — keeping the writer active
+            # most of the time.
+            #
+            # sqlite3.Connection.backup() uses SQLite's cooperative locking:
+            # it acquires a SHARED lock, copies all pages atomically, and retries
+            # any pages changed by a concurrent writer.  The result is always a
+            # self-consistent snapshot, even while the writer is active.
+            #
+            # If the file is not a SQLite database (legacy HDF5 .hst from
+            # pyOptSparse 1.x), sqlite3.connect() will raise DatabaseError
+            # ("file is not a database"), which is caught by the outer _retry()
+            # and surfaced as a warning — the same behaviour as before.
+            try:
+                # NOTE: sqlite3.connect() used as a context manager only manages
+                # transactions (commit/rollback); it does NOT close the connection.
+                # Explicit close() calls are required to release file handles on
+                # Windows — otherwise the file stays locked until GC.
+                src_con = sqlite3.connect(str(hist_path), timeout=1.0)
+                try:
+                    dst_con = sqlite3.connect(str(tmp_path))
+                    try:
+                        src_con.backup(dst_con, pages=-1)
+                    finally:
+                        dst_con.close()
+                finally:
+                    src_con.close()
+            except sqlite3.DatabaseError:
+                # Not a SQLite database — fall back to a best-effort file copy
+                # (preserves compatibility with HDF5-based legacy .hst files).
+                shutil.copy2(hist_path, tmp_path)
             hist = self._history_factory(str(tmp_path), flag="r")
             try:
                 iter_keys = [
