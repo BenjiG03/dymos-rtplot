@@ -4,6 +4,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -152,6 +153,52 @@ class HistoryBackupTests(unittest.TestCase):
         # Should return a warning snapshot rather than raising
         self.assertIsNotNone(snapshot)
         self.assertIsNotNone(snapshot.warning)
+
+    def test_lock_timeout_on_sqlite_returns_warning_not_corrupt_copy(self):
+        """A backup() lock-timeout must propagate as a warning, not silently fall
+        back to shutil.copy2() on the live file.
+
+        Root cause: sqlite3.OperationalError IS a subclass of sqlite3.DatabaseError.
+        The old code caught DatabaseError and fell back to shutil.copy2(), so a
+        transient 'database is locked' timeout would copy a potentially mid-write
+        database — producing 'database disk image is malformed'.
+
+        The fix detects SQLite vs non-SQLite by file magic BEFORE entering the
+        backup path, so OperationalError can never reach the shutil.copy2 fallback.
+        """
+        import dymos_rtplot.realtime_plot.realtime_data as _rrd_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            hist_path = Path(td) / "locked.hst"
+            _make_fake_hst(hist_path, n_rows=5)
+
+            access = OptimizerHistoryAccess(
+                hist_file=str(hist_path),
+                history_factory=_FakeHistoryResult,
+            )
+
+            # sqlite3.Connection is a C type whose methods cannot be patched directly.
+            # Instead, patch the sqlite3 module name inside realtime_data so every
+            # sqlite3.connect() call returns a mock whose backup() raises
+            # OperationalError.  We keep the real exception classes so the
+            # propagation path works correctly.
+            real_sqlite3 = _rrd_mod.sqlite3
+
+            def _make_locked_con(path, **kw):
+                m = MagicMock()
+                m.backup.side_effect = real_sqlite3.OperationalError("database is locked")
+                return m
+
+            mock_sqlite3 = MagicMock(wraps=real_sqlite3)
+            mock_sqlite3.connect.side_effect = _make_locked_con
+
+            with patch.object(_rrd_mod, "sqlite3", mock_sqlite3):
+                snapshot = access.read_if_changed(previous_mtime=None)
+
+        # Must surface as a warning — NOT silently fall back to a racy file copy
+        self.assertIsNotNone(snapshot)
+        self.assertIsNotNone(snapshot.warning)
+        self.assertIn("locked", snapshot.warning.lower())
 
     def test_read_snapshot_concurrent_writer_no_corruption(self):
         """backup() survives concurrent writes without producing a corrupt copy.

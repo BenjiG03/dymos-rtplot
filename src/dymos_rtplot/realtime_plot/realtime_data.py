@@ -147,30 +147,49 @@ class OptimizerHistoryAccess:
         with tempfile.NamedTemporaryFile(prefix="dymos_rtplot_", suffix=hist_path.suffix, delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
-            # Use SQLite's online backup API instead of shutil.copy2.
+            # Decide upfront whether the file is SQLite or a legacy format (e.g.
+            # HDF5 from pyOptSparse 1.x) by reading the file magic bytes.  This
+            # keeps the two code paths structurally separate and prevents a lock-
+            # timeout error from accidentally falling through to the racy file-
+            # copy path.
             #
-            # pyOptSparse 2.x stores history as a SQLite database.  A plain
-            # shutil.copy2() of a live SQLite file can capture the main .db
-            # file in mid-commit without the companion -journal, producing a
-            # copy that raises "database disk image is malformed" when opened.
-            # This is especially likely with IPOPT, whose line-search writes a
-            # new row on every function evaluation — keeping the writer active
-            # most of the time.
+            # Why the magic-check matters
+            # ───────────────────────────
+            # sqlite3.OperationalError ("database is locked") IS a subclass of
+            # sqlite3.DatabaseError.  If we used a single try/except around the
+            # backup call and caught DatabaseError, a transient lock timeout would
+            # be silently swallowed and fall back to shutil.copy2() on a live
+            # database — producing exactly the "database disk image is malformed"
+            # error the backup was meant to prevent.
             #
-            # sqlite3.Connection.backup() uses SQLite's cooperative locking:
-            # it acquires a SHARED lock, copies all pages atomically, and retries
-            # any pages changed by a concurrent writer.  The result is always a
-            # self-consistent snapshot, even while the writer is active.
-            #
-            # If the file is not a SQLite database (legacy HDF5 .hst from
-            # pyOptSparse 1.x), sqlite3.connect() will raise DatabaseError
-            # ("file is not a database"), which is caught by the outer _retry()
-            # and surfaced as a warning — the same behaviour as before.
+            # pyOptSparse 2.x uses sqlitedict which spins a background
+            # SqliteMultithread thread and issues `PRAGMA synchronous=OFF`.
+            # IPOPT writes a row on every function evaluation, so the database
+            # is committed very frequently.  A 1-second lock-acquire timeout on
+            # our backup connection is therefore plausible on a busy system.
+            _SQLITE_MAGIC = b'SQLite format 3\x00'
             try:
+                with open(str(hist_path), 'rb') as _f:
+                    _magic = _f.read(16)
+            except OSError:
+                _magic = b''
+            _is_sqlite = (_magic == _SQLITE_MAGIC)
+
+            if _is_sqlite:
+                # SQLite history (pyOptSparse 2.x): use the online backup API.
+                #
+                # sqlite3.Connection.backup() acquires a SHARED lock and copies
+                # all pages atomically, retrying any pages changed by a concurrent
+                # writer.  The result is always a self-consistent snapshot.
+                #
                 # NOTE: sqlite3.connect() used as a context manager only manages
                 # transactions (commit/rollback); it does NOT close the connection.
                 # Explicit close() calls are required to release file handles on
                 # Windows — otherwise the file stays locked until GC.
+                #
+                # If backup() raises (e.g. OperationalError: database is locked),
+                # the error propagates to _retry() and then to read_if_changed()
+                # which surfaces it as a warning — correct behaviour, no racy copy.
                 src_con = sqlite3.connect(str(hist_path), timeout=1.0)
                 try:
                     dst_con = sqlite3.connect(str(tmp_path))
@@ -180,9 +199,8 @@ class OptimizerHistoryAccess:
                         dst_con.close()
                 finally:
                     src_con.close()
-            except sqlite3.DatabaseError:
-                # Not a SQLite database — fall back to a best-effort file copy
-                # (preserves compatibility with HDF5-based legacy .hst files).
+            else:
+                # Non-SQLite (legacy HDF5 or other) history file — best-effort copy.
                 shutil.copy2(hist_path, tmp_path)
             hist = self._history_factory(str(tmp_path), flag="r")
             try:
