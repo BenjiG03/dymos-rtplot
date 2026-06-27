@@ -140,12 +140,18 @@ def _aligned_dense_state_matrices(grid_data, output_grid_data):
     return None
 
 
+def _is_shooting_transcription(transcription):
+    return type(transcription).__name__ in {'ExplicitShooting', 'PicardShooting'}
+
+
 def _supports_exact_state_interp(transcription):
     cls_name = type(transcription).__name__
-    return cls_name in {'GaussLobatto', 'Radau', 'RadauNew', 'Birkhoff'}
+    return cls_name in {'GaussLobatto', 'Radau', 'Birkhoff'}
 
 
-def _supports_exact_control_interp(grid_data):
+def _supports_exact_control_interp(transcription, grid_data):
+    if _is_shooting_transcription(transcription):
+        return False
     try:
         return (
             'control_disc' in grid_data.subset_num_nodes
@@ -210,9 +216,17 @@ def _timeseries_output_meta(phase):
 
 
 def _defect_output_meta(phase):
+    """Return defect output paths for collocation-based transcriptions.
+
+    Shooting methods (ExplicitShooting, PicardShooting) integrate the ODE directly
+    and do not build collocation_constraint or continuity_comp subcomponents.
+    """
     outputs = {}
-    phase_path = _phase_promoted_path(phase)
     transcription = phase.options['transcription']
+    if _is_shooting_transcription(transcription):
+        return outputs
+
+    phase_path = _phase_promoted_path(phase)
     grid_data = transcription.grid_data
 
     collocation_ptau = (
@@ -366,7 +380,7 @@ def build_rtplot_metadata(problem, case_recorder_filename):
                 state_interp = _aligned_dense_state_matrices(grid_data, output_grid)
             if state_interp is not None:
                 phase_meta['state_interp'] = state_interp
-            if _supports_exact_control_interp(grid_data):
+            if _supports_exact_control_interp(transcription, grid_data):
                 phase_meta['control_interp'] = _aligned_dense_control_matrices(grid_data, output_grid)
 
             for state_name, options in phase.state_options.items():

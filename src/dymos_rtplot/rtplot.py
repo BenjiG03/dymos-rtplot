@@ -119,13 +119,22 @@ def main(argv=None):
         _rtplot_cmd(args, user_args)
     elif args.command == 'clean':
         result = clean_rtplot_artifacts(args.path, dry_run=args.dry_run)
-        print(f"RTPlot cleanup root: {result['root']}")
-        print(f"Directories: {len(result['dirs'])}")
-        for path in result['dirs']:
-            print(path)
-        print(f"Files: {len(result['files'])}")
-        for path in result['files']:
-            print(path)
+        dry = result.get('dry_run', args.dry_run)
+        verb = "Would remove" if dry else "Removed"
+        prefix = "[DRY RUN] " if dry else ""
+        total = len(result['files']) + len(result['dirs'])
+        print(f"{prefix}RTPlot cleanup in: {result['root']}")
+        if total == 0:
+            print("  Nothing to remove.")
+        else:
+            for path in result['files']:
+                print(f"  {verb}: {path}")
+            for path in result['dirs']:
+                print(f"  {verb}: {path}  (directory tree)")
+            print(f"  {verb} {total} item(s).")
+        if dry:
+            print("  Re-run without --dry-run to delete.")
+
     elif args.command in _TIMESERIES_PLOT_COMMANDS:
         from dymos_rtplot.timeseries_plotter import TimeseriesDataset, TimeseriesPlotterApp
 

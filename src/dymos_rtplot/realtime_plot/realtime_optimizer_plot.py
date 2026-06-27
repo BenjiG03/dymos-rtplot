@@ -1,7 +1,9 @@
 """A real-time plot monitoring the optimization process as an OpenMDAO script runs."""
 
 from collections import defaultdict
+import os
 import re
+import signal
 
 from openmdao.utils.shell_proc import _is_process_running
 from openmdao.core.constants import INF_BOUND
@@ -645,13 +647,20 @@ class _RealTimeOptimizerPlot(_RealTimePlot):
             ),
         )
 
-        quit_button = Button(label="Quit Application", button_type="danger")
+        quit_button = Button(label="Stop & Exit", button_type="danger")
 
-        # Define callback function for the quit button
         def quit_app():
-            raise KeyboardInterrupt("Quit button pressed")
+            from tornado.ioloop import IOLoop
+            print("Dymos RTPlot: stop requested by user.")
+            pid = self._pid_of_calling_script
+            if pid is not None and _is_process_running(pid):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    print(f"  Sent SIGTERM to source process (PID {pid}).")
+                except OSError as exc:
+                    print(f"  Could not terminate source process (PID {pid}): {exc}")
+            IOLoop.current().stop()
 
-        # Attach the callback to the button
         quit_button.on_click(quit_app)
 
         # header for the variable list

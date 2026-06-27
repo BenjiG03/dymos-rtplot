@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import numbers
+import os
+import signal
 
 import numpy as np
 from openmdao.core.constants import INF_BOUND
@@ -16,6 +18,7 @@ from dymos_rtplot.realtime_plot.realtime_optimizer_plot import _RealTimeOptimize
 from bokeh.layouts import column, gridplot, row
 from bokeh.models import (
     BoxAnnotation,
+    Button,
     CheckboxGroup,
     ColumnDataSource,
     Div,
@@ -28,8 +31,33 @@ from bokeh.models import (
     TabPanel,
     Tabs,
 )
+from tornado.ioloop import IOLoop
 from bokeh.palettes import Category10, Category20, RdBu11
 from bokeh.plotting import figure
+
+
+def _make_exit_button(source_pid=None):
+    """Return a 'Stop & Exit' button that terminates the source process and shuts down Bokeh."""
+    btn = Button(label="Stop & Exit", button_type="danger", width=140, height=36)
+
+    def _on_click():
+        print("Dymos RTPlot: stop requested by user.")
+        if source_pid is not None and _is_process_running(source_pid):
+            try:
+                os.kill(source_pid, signal.SIGTERM)
+                print(f"  Sent SIGTERM to source process (PID {source_pid}).")
+            except OSError as exc:
+                print(f"  Could not terminate source process (PID {source_pid}): {exc}")
+        IOLoop.current().stop()
+
+    btn.on_click(_on_click)
+    return btn
+
+
+def _exit_header_row(source_pid=None):
+    """Thin header row with a right-aligned Stop & Exit button."""
+    spacer = Div(text="", sizing_mode="stretch_width")
+    return row(spacer, _make_exit_button(source_pid), sizing_mode="stretch_width", height=46)
 
 
 _HEAVY_TAB_STRIDE = 5
@@ -254,21 +282,6 @@ def _format_suspicious_labels(labels, limit=6):
     return ", ".join(shown)
 
 
-def _normalize_trace_arrays(xvals, yvals, violation=None):
-    x = np.asarray(xvals, dtype=float).reshape(-1)
-    y = np.asarray(yvals, dtype=float).reshape(-1)
-    common_len = min(len(x), len(y))
-    violation_arr = None
-    if violation is not None:
-        violation_arr = np.asarray(violation, dtype=bool).reshape(-1)
-        common_len = min(common_len, len(violation_arr))
-    x = x[:common_len]
-    y = y[:common_len]
-    if violation_arr is None:
-        return x, y, np.zeros(common_len, dtype=bool)
-    return x, y, violation_arr[:common_len]
-
-
 class _TrajectoryTab:
     _CATEGORY_LABELS = {
         "controls": "Controls",
@@ -286,6 +299,7 @@ class _TrajectoryTab:
         self._phase_paths = {}
         self._phase_meta = {}
         self._last_order = None
+        self._interp_cache: dict = {}
         self._status = _styled_div("Waiting for trajectory data...")
         self._warning = _styled_div("")
         self._traj_select = Select(title="Trajectory", options=[], value=None)
@@ -505,7 +519,7 @@ class _TrajectoryTab:
                         banner_parts.append(warning)
                     if xvals is None:
                         continue
-                    xvals, yvals, violation_mask = _normalize_trace_arrays(xvals, yvals, violation_mask)
+                    xvals, yvals, violation_mask = _collapse_repeated_samples(xvals, yvals, violation_mask)
 
                     phase_name = phase_meta["name"]
                     traces_x.append(xvals.tolist())
@@ -533,6 +547,17 @@ class _TrajectoryTab:
 
         self._status.text = f"Major iteration {snapshot.major_iteration}, driver counter {snapshot.counter}"
         self._warning.text = " ".join(sorted(set(banner_parts)))
+
+    def _get_interp(self, phase_meta, key):
+        """Return cached numpy-array version of an interp dict, converting once from JSON lists."""
+        cache_key = (phase_meta['promoted_path'], key)
+        if cache_key not in self._interp_cache:
+            raw = phase_meta[key]
+            arrays = {k: np.asarray(v, dtype=float) for k, v in raw.items() if k != 'mode'}
+            if 'mode' in raw:
+                arrays['mode'] = raw['mode']
+            self._interp_cache[cache_key] = arrays
+        return self._interp_cache[cache_key]
 
     def _phase_trace(self, snapshot, phase_meta, category, variable):
         case = snapshot.case
@@ -602,38 +627,41 @@ class _TrajectoryTab:
         size = int(np.prod(shape))
         xd_flat = np.reshape(state_disc, (state_disc.shape[0], size))
 
-        interp = phase_meta["state_interp"]
+        interp = self._get_interp(phase_meta, "state_interp")
         dt_dstau = 0.5 * _scalar_item(case.get_val(f"{phase_path}.t_duration")) * np.asarray(
             phase_meta["dense_grid"]["node_dptau_dstau"], dtype=float
         )
         dense_x = self._physical_time(case, phase_meta)
         if interp.get("mode") == "lagrange":
-            lmat = np.asarray(interp["L"], dtype=float)
-            dmat = np.asarray(interp["D"], dtype=float)
+            lmat = interp["L"]
+            dmat = interp["D"]
             if rates_only:
                 dense_val = dmat.dot(xd_flat) / dt_dstau[:, np.newaxis]
             else:
                 dense_val = lmat.dot(xd_flat)
         else:
             rate_meta = state_meta["rate_source"]
+            rate_path = rate_meta["path"] if rate_meta else None
             try:
-                rate_values = np.asarray(case.get_val(rate_meta["path"]))
+                if rate_path is None:
+                    raise ValueError("rate_source is None")
+                rate_values = np.asarray(case.get_val(rate_path))
             except Exception:
                 return self._timeseries_trace(
                     case,
                     phase_meta,
                     f"timeseries.states:{variable}",
                     boundary_state=state_meta,
-                    warning=f"Missing exact state rate source {rate_meta['path']}; using recorded nodes.",
+                    warning=f"Missing exact state rate source {rate_path}; using recorded nodes.",
                 )
 
             row_idx = np.asarray(rate_meta["rows"], dtype=int)
             rate_disc = rate_values[row_idx]
             fd_flat = np.reshape(rate_disc, (rate_disc.shape[0], size))
-            ai = np.asarray(interp["Ai"], dtype=float)
-            bi = np.asarray(interp["Bi"], dtype=float)
-            ad = np.asarray(interp["Ad"], dtype=float)
-            bd = np.asarray(interp["Bd"], dtype=float)
+            ai = interp["Ai"]
+            bi = interp["Bi"]
+            ad = interp["Ad"]
+            bd = interp["Bd"]
             if rates_only:
                 dense_val = ad.dot(xd_flat) / dt_dstau[:, np.newaxis] + bd.dot(fd_flat)
             else:
@@ -661,13 +689,13 @@ class _TrajectoryTab:
         shape = tuple(control_meta["shape"])
         size = int(np.prod(shape))
         control_flat = np.reshape(control, (control.shape[0], size))
-        interp = phase_meta["control_interp"]
+        interp = self._get_interp(phase_meta, "control_interp")
         if derivative_order == 0:
-            mat = np.asarray(interp["L"], dtype=float)
+            mat = interp["L"]
         elif derivative_order == 1:
-            mat = np.asarray(interp["D"], dtype=float)
+            mat = interp["D"]
         else:
-            mat = np.asarray(interp["D2"], dtype=float)
+            mat = interp["D2"]
         try:
             dense_val = mat.dot(control_flat)
         except ValueError:
@@ -1478,7 +1506,9 @@ class _RealTimeDymosDashboard:
             sizing_mode="stretch_both",
         )
         self._tabs.on_change("active", self._active_tab_changed)
-        self._doc.add_root(self._tabs)
+        self._doc.add_root(
+            column(_exit_header_row(pid_of_calling_script), self._tabs, sizing_mode="stretch_both")
+        )
         self._bootstrap_existing_data()
         self._doc.add_periodic_callback(self._update, callback_period)
         self._doc.title = "Dymos RTPlot Dashboard"
@@ -1584,7 +1614,9 @@ class _StandaloneDashboardTabApp:
             broker=self._broker,
             highlight_jacobian_structure=highlight_jacobian_structure,
         )
-        self._doc.add_root(panel.child)
+        self._doc.add_root(
+            column(_exit_header_row(pid_of_calling_script), panel.child, sizing_mode="stretch_both")
+        )
         self._update()
         self._doc.add_periodic_callback(self._update, callback_period)
         self._doc.title = f"Dymos RTPlot - {DASHBOARD_TAB_TITLES[tab_name]}"

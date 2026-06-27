@@ -707,6 +707,12 @@ def _rtplot_cmd(options, user_args):
                     'grad_lag_x',
                 })
                 opt_settings['save_major_iteration_variables'] = sorted(existing)
+            # driver._setup_recording() already ran before Problem._setup_recording()
+            # (see problem.py final_setup: driver._setup_recording(); self._setup_recording()).
+            # Call it again so that the auto-recorder added above (and any recording_options
+            # changes) are picked up.  SqliteRecorder.startup() is idempotent for recorders
+            # that were already initialized, so existing recorders are unaffected.
+            driver._setup_recording()
 
         # register the hook
         hooks._register_hook(
