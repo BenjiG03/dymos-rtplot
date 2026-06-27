@@ -26,6 +26,14 @@ def _as_jsonable(value):
     return value
 
 
+def _option_value(options, key, default=None):
+    """Return a Dymos option value across OptionsDictionary variants."""
+    try:
+        return options[key]
+    except Exception:
+        return default
+
+
 def _phase_promoted_path(phase):
     return phase.pathname.replace('.phases.', '.')
 
@@ -371,12 +379,22 @@ def build_rtplot_metadata(problem, case_recorder_filename):
                 }
 
             for control_name, options in phase.control_options.items():
+                control_type = _option_value(options, 'control_type', 'full')
+                control_path = (
+                    f'{phase_meta["promoted_path"]}.polynomial_controls:{control_name}'
+                    if control_type == 'polynomial'
+                    else f'{phase_meta["promoted_path"]}.controls:{control_name}'
+                )
+                shape = _option_value(options, 'shape', (1,))
+                if shape is None:
+                    shape = (1,)
                 phase_meta['controls'][control_name] = {
-                    'units': options['units'],
-                    'shape': list(options['shape']),
-                    'lower': _as_jsonable(options['lower'] if 'lower' in options else None),
-                    'upper': _as_jsonable(options['upper'] if 'upper' in options else None),
-                    'control_type': options['control_type'] if 'control_type' in options else 'full',
+                    'units': _option_value(options, 'units'),
+                    'shape': list(shape),
+                    'lower': _as_jsonable(_option_value(options, 'lower')),
+                    'upper': _as_jsonable(_option_value(options, 'upper')),
+                    'control_type': control_type,
+                    'path': control_path,
                 }
 
             for name, data in _iter_constraint_entries(getattr(phase, '_path_constraints', {})):

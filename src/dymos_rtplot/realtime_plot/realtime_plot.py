@@ -8,7 +8,6 @@ import multiprocessing
 import os
 import queue
 import shutil
-import sqlite3
 import subprocess
 import sys
 import time
@@ -36,6 +35,7 @@ from dymos_rtplot.realtime_plot.realtime_dashboard import (
     _set_dark_mode_enabled as _set_dashboard_dark_mode_enabled,
     get_dashboard_tab_names,
 )
+from dymos_rtplot.realtime_plot.realtime_data import CaseRecorderAccess
 from dymos_rtplot.realtime_plot.realtime_metadata import (
     load_rtplot_metadata,
     write_rtplot_metadata,
@@ -116,15 +116,79 @@ _DARK_THEME_JSON = {
 }
 
 
+def _driver_supports_optimization(driver):
+    """Return True when an OpenMDAO driver is an optimizer driver."""
+    supports = getattr(driver, "supports", None)
+    if supports is not None:
+        try:
+            if isinstance(supports, dict):
+                value = supports.get("optimization", False)
+            else:
+                value = supports["optimization"]
+            return bool(value)
+        except Exception:
+            pass
+
+    metadata_supports = getattr(driver, "_supports", None)
+    if metadata_supports is not None:
+        try:
+            value = metadata_supports.get("optimization", False)
+            if isinstance(value, dict) and "val" in value:
+                value = value["val"]
+            return bool(value)
+        except Exception:
+            pass
+
+    options = getattr(driver, "options", None)
+    if options is not None:
+        try:
+            return bool(options["optimizer"])
+        except Exception:
+            return False
+
+    return False
+
+
+def _should_skip_dashboard_launch_for_driver(driver, dashboard_mode):
+    """Guard dashboard launches that are not valid for the current driver."""
+    return (
+        dashboard_mode == _DASHBOARD_MODE_MULTIWINDOW
+        and not _driver_supports_optimization(driver)
+    )
+
+
+def _is_nested_dymos_problem(problem):
+    """Return True for internal Dymos Problems that should not be instrumented."""
+    metadata = getattr(problem, "_metadata", {}) or {}
+    names = (
+        getattr(problem, "_name", None),
+        metadata.get("name"),
+        metadata.get("pathname"),
+    )
+    return any("_subprob" in str(name) for name in names if name)
+
+
+class _RtplotDriverSelector:
+    """Select the single script driver that rtplot should instrument."""
+
+    def __init__(self, dashboard_mode):
+        self._dashboard_mode = dashboard_mode
+        self._primary_driver_id = None
+
+    def accepts(self, problem, driver):
+        if _is_nested_dymos_problem(problem):
+            return False
+        if _should_skip_dashboard_launch_for_driver(driver, self._dashboard_mode):
+            return False
+        if self._primary_driver_id is None:
+            self._primary_driver_id = id(driver)
+        return id(driver) == self._primary_driver_id
+
+
 def _apply_dark_theme(doc, enabled=True):
     if not bokeh_and_dependencies_available or not enabled:
         return
     doc.theme = Theme(json=_DARK_THEME_JSON)
-
-
-def _readonly_sqlite_connection(path):
-    db_uri = Path(path).resolve().as_uri().replace("file:///", "file:///") + "?mode=ro"
-    return sqlite3.connect(db_uri, uri=True)
 
 
 def clean_rtplot_artifacts(root_dir=".", dry_run=False):
@@ -365,6 +429,7 @@ def _append_dashboard_launch_args(cmd, options):
 
 
 def _add_dashboard_cli_arguments(parser):
+    tab_values = ", ".join(get_dashboard_tab_names())
     parser.add_argument(
         '-b', '--open-browser',
         action='store_true',
@@ -386,13 +451,13 @@ def _add_dashboard_cli_arguments(parser):
         '-t', '--tabs',
         type=str,
         default=None,
-        help='Comma-separated dashboard tabs to launch in multiwindow mode.',
+        help=f'Comma-separated dashboard tabs to launch in multiwindow mode. Valid tabs: {tab_values}.',
     )
     parser.add_argument(
         '-c', '--tab-core',
         type=str,
         default=None,
-        help='Comma-separated CPU affinity assignments in the form tab=core for multiwindow mode.',
+        help=f'Comma-separated CPU affinity assignments in the form tab=core for multiwindow mode. Valid tabs: {tab_values}.',
     )
     parser.add_argument(
         '-p', '--base-port',
@@ -533,12 +598,15 @@ def _rtplot_cmd(options, user_args):
         script_path = file_path
     else:
         script_path = None
+    driver_selector = _RtplotDriverSelector(options.dashboard_mode)
 
     def _view_realtime_plot_hook(problem):
         driver = problem.driver
         if not driver:
             raise RuntimeError(
                 "Unable to run realtime optimization progress plot because no Driver")
+        if not driver_selector.accepts(problem, driver):
+            return
         if len(problem.driver._rec_mgr._recorders) == 0:
             raise RuntimeError(
                 "Unable to run realtime optimization progress plot "
@@ -615,7 +683,11 @@ def _rtplot_cmd(options, user_args):
             driver = problem.driver
             if not driver:
                 return
+            if not driver_selector.accepts(problem, driver):
+                return
             if len(driver._rec_mgr._recorders) == 0:
+                if not _driver_supports_optimization(driver):
+                    return
                 auto_case_path = Path(file_path).resolve().with_name(
                     f"{Path(file_path).stem}_rtplot_auto_{os.getpid()}.sqlite"
                 )
@@ -653,55 +725,32 @@ def _rtplot_cmd(options, user_args):
 
 
 class _CaseRecorderTracker:
-    """
-    A class that is used to get information from a case recorder.
-
-    This class was created to handle the realtime reading of a case recorder file.
-    These features are not provided by the SqliteCaseReader class.
-    """
+    """Stateful realtime reader for one OpenMDAO driver recorder."""
 
     def __init__(self, case_recorder_filename):
         self._case_recorder_filename = case_recorder_filename
-        self._cr = None
-        self._initial_case = (
-            None  # need the initial case to get info about the variables
-        )
+        self._access = CaseRecorderAccess(case_recorder_filename, SqliteCaseReader)
+        self._initial_case = None
         self._next_id_to_read = 1
         self._pid_of_calling_script = None
 
     def get_case_reader(self):
-        return self._cr
+        return self._access.get_case_reader()
 
     def set_source_process_pid(self, pid):
         self._pid_of_calling_script = pid
 
     def _open_case_recorder(self):
-        if self._cr is None:
-            self._cr = SqliteCaseReader(self._case_recorder_filename)
+        self._access.get_case_reader()
 
     def get_case_recorder_filename(self):
         return self._case_recorder_filename
 
     def is_driver_optimizer(self):
-        self._open_case_recorder()
-        return self._cr.problem_metadata["driver"]["supports"]["optimization"]["val"]
+        return self._access.is_driver_optimizer()
 
     def _get_case_by_counter(self, counter):
-        # use SQL to see if a case with this counter exists
-        with _readonly_sqlite_connection(self._case_recorder_filename) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            cur.execute(
-                "SELECT * FROM driver_iterations WHERE " "counter=:counter",
-                {"counter": counter},
-            )
-            row = cur.fetchone()
-
-        if row:
-            self._open_case_recorder()
-            return self._cr._driver_cases.get_case(row["iteration_coordinate"])
-        else:
-            return None
+        return self._access.get_case_by_counter(counter)
 
     def get_case_by_counter(self, counter):
         return self._get_case_by_counter(counter)
@@ -775,8 +824,9 @@ class _CaseRecorderTracker:
         return (var_info['lower'], var_info['upper'])
 
     def _get_desvar_bounds(self, name):
-        lower = self._cr.problem_metadata['variables'][name]['lower']
-        upper = self._cr.problem_metadata['variables'][name]['upper']
+        reader = self.get_case_reader()
+        lower = reader.problem_metadata['variables'][name]['lower']
+        upper = reader.problem_metadata['variables'][name]['upper']
         return lower, upper
 
     def _get_units(self, name):
@@ -826,7 +876,7 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
                 case_recorder_filename=case_recorder_filename,
             )
             if tab_name == CASE_PLOTTER_TAB:
-                _RealTimeOptimizerPlot(
+                plot = _RealTimeOptimizerPlot(
                     case_tracker,
                     callback_period,
                     doc,
@@ -835,6 +885,7 @@ def _serve_dashboard_tab_process(startup_queue, tab_name, core, case_recorder_fi
                     add_root=True,
                     start_callback=True,
                 )
+                plot._update_wrapped_in_try()
                 doc.title = f"Dymos RTPlot - {DASHBOARD_TAB_TITLES[tab_name]}"
             else:
                 _StandaloneDashboardTabApp(

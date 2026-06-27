@@ -13,10 +13,14 @@ from dymos_rtplot.realtime_plot.realtime_plot import (
 )
 
 
+_SUBCOMMANDS = {'realtime_plot', 'rtplot', 'clean', 'timeseries-plot', 'timeseries-plots'}
+_TIMESERIES_PLOT_COMMANDS = {'timeseries-plot', 'timeseries-plots'}
+
+
 def _looks_like_rtplot_invocation(raw_args):
     if not raw_args:
         return False
-    if raw_args[0] in {'realtime_plot', 'rtplot', 'clean'}:
+    if raw_args[0] in _SUBCOMMANDS:
         return False
     if raw_args[0] in {'-h', '--help'}:
         return True
@@ -28,6 +32,10 @@ def _build_entrypoint_parser():
     parser.add_argument('file', nargs='?', help='Python file containing the model.')
     _add_dashboard_cli_arguments(parser)
     return parser
+
+
+def _has_entrypoint_options(raw_args):
+    return any(arg.startswith('-') for arg in raw_args)
 
 
 def main(argv=None):
@@ -64,6 +72,8 @@ def main(argv=None):
         elif raw_args and raw_args[0] in {'-h', '--help'}:
             entrypoint_parser.print_help()
             return
+        elif _has_entrypoint_options(raw_args):
+            entrypoint_parser.error("the following arguments are required: file")
 
     parser = argparse.ArgumentParser(prog='python -m dymos_rtplot.rtplot')
     subparsers = parser.add_subparsers(dest='command')
@@ -77,6 +87,29 @@ def main(argv=None):
     clean_parser = subparsers.add_parser('clean')
     clean_parser.add_argument('path', nargs='?', default='.', help='Root directory to clean RTPlot artifacts from.')
     clean_parser.add_argument('--dry-run', action='store_true', help='Show what would be removed without deleting it.')
+
+    timeseries_parser = subparsers.add_parser(
+        'timeseries-plot',
+        aliases=['timeseries-plots'],
+        help='Open the offline Dymos timeseries plotting tool.',
+    )
+    timeseries_parser.add_argument(
+        'recorder',
+        nargs='+',
+        help='OpenMDAO/Dymos recorder SQLite or DB file(s) containing timeseries cases.',
+    )
+    timeseries_parser.add_argument('--metadata', default=None, help='Optional .rtplot_meta.json sidecar path for one recorder.')
+    timeseries_parser.add_argument('--case', default='last', help="Driver case to plot: 'last' or an integer counter.")
+    timeseries_parser.add_argument(
+        '--no-auto-simulation',
+        action='store_true',
+        help='Do not auto-load traj_simulation_0_out/dymos_simulation.db next to dymos_solution.db.',
+    )
+    timeseries_parser.add_argument(
+        '--project',
+        default=None,
+        help='Optional plot project JSON file to load on startup.',
+    )
 
     args, user_args = parser.parse_known_args(raw_args)
 
@@ -93,6 +126,16 @@ def main(argv=None):
         print(f"Files: {len(result['files'])}")
         for path in result['files']:
             print(path)
+    elif args.command in _TIMESERIES_PLOT_COMMANDS:
+        from dymos_rtplot.timeseries_plotter import TimeseriesDataset, TimeseriesPlotterApp
+
+        dataset = TimeseriesDataset(
+            args.recorder,
+            metadata_path=args.metadata,
+            case=args.case,
+            auto_simulation=not args.no_auto_simulation,
+        )
+        TimeseriesPlotterApp(dataset, project_path=args.project).run()
     else:
         parser.print_help()
 
