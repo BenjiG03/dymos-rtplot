@@ -82,7 +82,8 @@ class DashboardLifecycleTests(unittest.TestCase):
 
         with mock.patch("dymos_rtplot.realtime_plot.realtime_dashboard.LiveDataBroker", _FakeBroker), \
              mock.patch("dymos_rtplot.realtime_plot.realtime_dashboard._build_dashboard_tab", side_effect=build_tab), \
-             mock.patch("dymos_rtplot.realtime_plot.realtime_dashboard.Tabs", _FakeTabs):
+             mock.patch("dymos_rtplot.realtime_plot.realtime_dashboard.Tabs", _FakeTabs), \
+             mock.patch("dymos_rtplot.realtime_plot.realtime_dashboard.column", lambda *a, **kw: mock.Mock()):
             realtime_dashboard._RealTimeDymosDashboard(
                 _FakeCaseTracker(),
                 callback_period=300,

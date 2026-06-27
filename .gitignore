@@ -206,6 +206,7 @@ tempCodeRunnerFile.py
 # Local experiments
 scratch/
 multiphase_dymos_rtplot_mission_out/
+tests/run_ipopt_brachistochrone.py
 
 # Ruff stuff:
 .ruff_cache/

@@ -524,6 +524,9 @@ class MultiWindowParsingTests(unittest.TestCase):
         with mock.patch(
             "dymos_rtplot.realtime_plot.realtime_dashboard._build_dashboard_tab",
             return_value=(fake_tab, fake_panel),
+        ), mock.patch(
+            "dymos_rtplot.realtime_plot.realtime_dashboard.column",
+            lambda *a, **kw: mock.Mock(),
         ):
             app = realtime_dashboard._StandaloneDashboardTabApp(
                 realtime_dashboard.TRAJECTORY_TAB,
@@ -536,7 +539,7 @@ class MultiWindowParsingTests(unittest.TestCase):
                 hist_file="demo.hst",
             )
         self.assertIs(app._tab, fake_tab)
-        self.assertEqual(doc.roots, ["child-root"])
+        self.assertEqual(len(doc.roots), 1)  # one root added (column wrapping header + content)
         self.assertEqual(len(doc.callbacks), 1)
         self.assertEqual(doc.callbacks[0][1], 250)
         self.assertEqual(doc.title, "Dymos RTPlot - Trajectory")
@@ -768,8 +771,8 @@ class MultiWindowParsingTests(unittest.TestCase):
         self.assertEqual(list(yvals), [10.0, 20.0])
         self.assertEqual(list(violation), [False, True])
 
-    def test_normalize_trace_arrays_trims_to_common_length(self):
-        xvals, yvals, violation = realtime_dashboard._normalize_trace_arrays(
+    def test_collapse_repeated_samples_trims_to_common_length(self):
+        xvals, yvals, violation = realtime_dashboard._collapse_repeated_samples(
             [0.0, 1.0, 2.0, 3.0],
             [10.0, 20.0, 30.0],
             [False, True],
